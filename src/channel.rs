@@ -66,19 +66,26 @@ unsafe impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> Sync for MqG
 
 impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqSender<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MqSender").field("queue", &self.queue).finish()
+        f.debug_struct("MqSender")
+            .field("queue", &self.queue)
+            .finish()
     }
 }
 
 impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqReceiver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MqSender").field("queue", &self.queue).finish()
+        f.debug_struct("MqSender")
+            .field("queue", &self.queue)
+            .finish()
     }
 }
 
 impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqGuard<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MqGuard").field("ack", &self.ack).field("elem", &self.read()).finish()
+        f.debug_struct("MqGuard")
+            .field("ack", &self.ack)
+            .field("elem", &self.read())
+            .finish()
     }
 }
 
@@ -153,7 +160,9 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MessageQueue<T
 }
 
 #[tracing::instrument]
-pub fn channel<T: Send + Clone + std::fmt::Debug + tracing::Value>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
+pub fn channel<T: Send + Clone + std::fmt::Debug + tracing::Value>(
+    cap: u16,
+) -> (MqSender<T>, MqReceiver<T>) {
     tracing::debug!("Creating new channel");
 
     let queue_s = sync::Arc::new(MessageQueue::new(cap));
@@ -180,13 +189,21 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqSender<T> {
         wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
     ) -> Self {
         queue.sender_register();
-        Self { queue, close: sync::Arc::new(sync::atomic::AtomicBool::new(false)), wake }
+        Self {
+            queue,
+            close: sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            wake,
+        }
     }
 
     #[cfg(not(feature = "loom"))]
     fn new(queue: sync::Arc<MessageQueue<T>>, wake: sync::Arc<Notify>) -> Self {
         queue.sender_register();
-        Self { queue, close: sync::Arc::new(sync::atomic::AtomicBool::new(false)), wake }
+        Self {
+            queue,
+            close: sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            wake,
+        }
     }
 
     fn resubscribe(&self) -> Self {
@@ -260,9 +277,15 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
 
     fn resubscribe(&self) -> Self {
         #[cfg(feature = "loom")]
-        self.wake.lock().unwrap().push_back(sync::Arc::new(Notify::new()));
+        self.wake
+            .lock()
+            .unwrap()
+            .push_back(sync::Arc::new(Notify::new()));
 
-        Self { queue: sync::Arc::clone(&self.queue), wake: sync::Arc::clone(&self.wake) }
+        Self {
+            queue: sync::Arc::clone(&self.queue),
+            wake: sync::Arc::clone(&self.wake),
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -310,7 +333,12 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
 
 impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> MqGuard<'a, T> {
     pub fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: std::ptr::NonNull<AckCell<T>>) -> Self {
-        MqGuard { ack: false, queue, cell_ptr, _phantom: std::marker::PhantomData }
+        MqGuard {
+            ack: false,
+            queue,
+            cell_ptr,
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     pub fn read(&self) -> T {
@@ -381,9 +409,14 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
     #[tracing::instrument]
     fn new(cap: u16) -> Self {
         assert_ne!(std::mem::size_of::<T>(), 0, "T cannot be a ZST");
-        assert!(cap > 0, "Tried to create a message queue with a capacity < 1");
+        assert!(
+            cap > 0,
+            "Tried to create a message queue with a capacity < 1"
+        );
 
-        let cap = cap.checked_next_power_of_two().expect("failed to retrieve the next power of 2 to cap");
+        let cap = cap
+            .checked_next_power_of_two()
+            .expect("failed to retrieve the next power of 2 to cap");
         tracing::debug!(cap, "Determining array layout");
         let layout = alloc::Layout::array::<AckCell<T>>(cap as usize).unwrap();
 
@@ -404,7 +437,12 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         let senders = sync::atomic::AtomicUsize::new(0);
         let read_write = sync::atomic::AtomicU64::new(get_raw_bytes(0, cap, 0, 0));
 
-        Self { ring, cap, senders, read_write }
+        Self {
+            ring,
+            cap,
+            senders,
+            read_write,
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -457,7 +495,13 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
             let writ_size = get_writ_size(raw_bytes);
             let read_indx = get_read_indx(raw_bytes);
             let read_size = get_read_size(raw_bytes);
-            tracing::debug!(writ_indx, writ_size, read_indx, read_size, "Trying to read from buffer");
+            tracing::debug!(
+                writ_indx,
+                writ_size,
+                read_indx,
+                read_size,
+                "Trying to read from buffer"
+            );
 
             if read_size == 0 {
                 // Note that we do not try to grow the read region in case there is nothing left to
@@ -471,7 +515,8 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                 tracing::debug!(read_indx, "Reading from buffer");
 
                 let read_indx_new = fast_mod(read_indx + 1, self.cap);
-                let raw_bytes_new = get_raw_bytes(writ_indx, writ_size, read_indx_new, read_size - 1);
+                let raw_bytes_new =
+                    get_raw_bytes(writ_indx, writ_size, read_indx_new, read_size - 1);
 
                 // So, this is a bit complicated. The issue is that we are mixing atomic (`load`,
                 // `store`) with non atomic (mod, decrement) operations. Why is this a problem?
@@ -537,7 +582,13 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
             let writ_size = get_writ_size(raw_bytes);
             let read_indx = get_read_indx(raw_bytes);
             let read_size = get_read_size(raw_bytes);
-            tracing::debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
+            tracing::debug!(
+                writ_indx,
+                writ_size,
+                read_indx,
+                read_size,
+                "Trying to write to buffer"
+            );
 
             if writ_size == 0 {
                 if let Ok(bytes) = self.grow(raw_bytes) {
@@ -553,7 +604,8 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                 // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
                 // whatever happens size > 0
                 let writ_indx_new = fast_mod(writ_indx + 1, self.cap);
-                let raw_bytes_new = get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size + 1);
+                let raw_bytes_new =
+                    get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size + 1);
 
                 if let Err(bytes) = self.read_write.compare_exchange(
                     raw_bytes,
@@ -655,7 +707,10 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
 
 impl<T: Clone + std::fmt::Debug + tracing::Value> AckCell<T> {
     fn new(elem: T) -> Self {
-        Self { elem: std::mem::MaybeUninit::new(elem), ack: sync::atomic::AtomicBool::new(false) }
+        Self {
+            elem: std::mem::MaybeUninit::new(elem),
+            ack: sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -681,7 +736,10 @@ fn get_read_size(raw_bytes: u64) -> u16 {
 
 #[tracing::instrument(skip_all)]
 fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16) -> u64 {
-    (writ_indx as u64) << 48 | (writ_size as u64) << 32 | (read_indx as u64) << 16 | read_size as u64
+    (writ_indx as u64) << 48
+        | (writ_size as u64) << 32
+        | (read_indx as u64) << 16
+        | read_size as u64
 }
 
 #[cfg(all(test, feature = "loom"))]
@@ -793,7 +851,11 @@ mod test_loom {
                 );
 
                 let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+                assert!(
+                    guard.is_none(),
+                    "Guard acquired on supposedly empty message queue: {:?}",
+                    guard.unwrap()
+                );
             });
 
             handle.join().unwrap();
@@ -836,7 +898,11 @@ mod test_loom {
                 }
 
                 let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+                assert!(
+                    guard.is_none(),
+                    "Guard acquired on supposedly empty message queue: {:?}",
+                    guard.unwrap()
+                );
             });
 
             handle.join().unwrap();
@@ -904,7 +970,11 @@ mod test_loom {
                 tracing::info!(?rx3, "Checking close correctness");
 
                 let guard = rx3.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+                assert!(
+                    guard.is_none(),
+                    "Guard acquired on supposedly empty message queue: {:?}",
+                    guard.unwrap()
+                );
 
                 let mut witness = witness3.lock().await;
                 tracing::info!(witness = ?*witness, "Checking receive correctness");
@@ -963,7 +1033,11 @@ mod test_loom {
 
                 tracing::info!("Checking close correctness");
                 let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+                assert!(
+                    guard.is_none(),
+                    "Guard acquired on supposedly empty message queue: {:?}",
+                    guard.unwrap()
+                );
 
                 res.sort();
                 tracing::info!(?res, "Checking receive correctness");
@@ -975,6 +1049,79 @@ mod test_loom {
 
             handle1.join().unwrap();
             handle2.join().unwrap();
+        })
+    }
+
+    #[test]
+    fn wrap_around() {
+        loom::model(|| {
+            let (sx1, rx) = channel(2);
+            let sx2 = sx1.resubscribe();
+
+            assert_eq!(sx1.queue.writ_indx(), 0);
+            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+            assert_eq!(sx1.queue.read_indx(), 0);
+            assert_eq!(sx1.queue.read_size(), 0);
+
+            let handle = loom::thread::spawn(move || {
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx1.send(i),
+                        None,
+                        "Failed to send 42, message queue is {:#?}",
+                        sx1.queue
+                    )
+                }
+            });
+
+            loom::future::block_on(async {
+                for i in 0..2 {
+                    tracing::info!("Waiting for element");
+                    let guard = rx.recv().await;
+                    assert_matches::assert_matches!(
+                        guard,
+                        Some(guard) => { assert_eq!(guard.read_acknowledge(),i); },
+                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                        rx.queue
+                    );
+                }
+            });
+            handle.join().unwrap();
+
+            let handle = loom::thread::spawn(move || {
+                for i in 2..4 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx2.send(i),
+                        None,
+                        "Failed to send 42, message queue is {:#?}",
+                        sx2.queue
+                    )
+                }
+            });
+
+            loom::future::block_on(async {
+                for i in 2..4 {
+                    tracing::info!("Waiting for element");
+                    let guard = rx.recv().await;
+                    assert_matches::assert_matches!(
+                        guard,
+                        Some(guard) => { assert_eq!(guard.read_acknowledge(), i); },
+                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                        rx.queue
+                    );
+                }
+
+                tracing::info!(?rx, "Checking close correctness");
+                let guard = rx.recv().await;
+                assert!(
+                    guard.is_none(),
+                    "Guard acquired on supposedly empty message queue: {:?}",
+                    guard.unwrap()
+                );
+            });
+            handle.join().unwrap();
         })
     }
 
