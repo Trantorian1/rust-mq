@@ -401,6 +401,7 @@ impl<T: TBound> MessageQueue<T> {
         // sure here, is this really necessary?
         assert!(layout.size() <= isize::MAX as usize);
 
+        debug!(?layout, "Allocating layout");
         let ptr = unsafe { alloc::alloc(layout) };
         let ring = match std::ptr::NonNull::new(ptr as *mut AckCell<T>) {
             Some(p) => p,
@@ -1011,7 +1012,7 @@ mod test_loom {
                     let guard = rx.recv().await;
                     assert_matches::assert_matches!(
                         guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge(),i); },
+                        Some(guard) => { assert_eq!(guard.read_acknowledge(), i); },
                         "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
                         rx.queue
                     );
@@ -1047,6 +1048,49 @@ mod test_loom {
                 let guard = rx.recv().await;
                 assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
             });
+            handle.join().unwrap();
+        })
+    }
+
+    #[test]
+    fn zst() {
+        loom::model(|| {
+            let (sx, rx) = channel(3);
+
+            assert_eq!(sx.queue.writ_indx(), 0);
+            assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
+            assert_eq!(sx.queue.read_indx(), 0);
+            assert_eq!(sx.queue.read_size(), 0);
+
+            let handle = loom::thread::spawn(move || {
+                for _ in 0..2 {
+                    tracing::info!("Sending element");
+                    assert_matches::assert_matches!(
+                        sx.send(()),
+                        None,
+                        "Failed to send 42, message queue is {:#?}",
+                        sx.queue
+                    )
+                }
+            });
+
+            loom::future::block_on(async move {
+                for i in 0..2 {
+                    tracing::info!("Waiting for element");
+                    let guard = rx.recv().await;
+                    assert_matches::assert_matches!(
+                        guard,
+                        Some(guard) => { assert_eq!(guard.read_acknowledge(), ()); },
+                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                        rx.queue
+                    );
+                }
+
+                tracing::info!(?rx, "Checking close correctness");
+                let guard = rx.recv().await;
+                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+            });
+
             handle.join().unwrap();
         })
     }
