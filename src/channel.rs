@@ -17,7 +17,24 @@ const WRIT_SIZE_MASK: u64 = 0x0000ffff00000000;
 const READ_INDX_MASK: u64 = 0x00000000ffff0000;
 const READ_SIZE_MASK: u64 = 0x000000000000ffff;
 
-pub struct MqSender<T: Send + Clone + std::fmt::Debug + tracing::Value> {
+#[cfg(test)]
+pub trait TBound: Send + Clone + std::fmt::Debug {}
+#[cfg(test)]
+impl<T: Send + Clone + std::fmt::Debug> TBound for T {}
+
+macro_rules! debug {
+    ($($arg:tt)+) => {
+        #[cfg(test)]
+        tracing::debug!($($arg)+)
+    };
+}
+
+#[cfg(not(test))]
+pub trait TBound: Send + Clone {}
+#[cfg(not(test))]
+impl<T: Send + Clone> TBound for T {}
+
+pub struct MqSender<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
     close: sync::Arc<sync::atomic::AtomicBool>,
     #[cfg(feature = "loom")]
@@ -26,7 +43,7 @@ pub struct MqSender<T: Send + Clone + std::fmt::Debug + tracing::Value> {
     wake: sync::Arc<Notify>,
 }
 
-pub struct MqReceiver<T: Send + Clone + std::fmt::Debug + tracing::Value> {
+pub struct MqReceiver<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
     #[cfg(feature = "loom")]
     wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
@@ -35,14 +52,14 @@ pub struct MqReceiver<T: Send + Clone + std::fmt::Debug + tracing::Value> {
 }
 
 #[must_use]
-pub struct MqGuard<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> {
+pub struct MqGuard<'a, T: TBound> {
     ack: bool,
     queue: sync::Arc<MessageQueue<T>>,
     cell_ptr: std::ptr::NonNull<AckCell<T>>,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
-struct MessageQueue<T: Send + Clone + std::fmt::Debug + tracing::Value> {
+struct MessageQueue<T: TBound> {
     ring: std::ptr::NonNull<AckCell<T>>,
     senders: sync::atomic::AtomicUsize,
     read_write: sync::atomic::AtomicU64,
@@ -50,39 +67,43 @@ struct MessageQueue<T: Send + Clone + std::fmt::Debug + tracing::Value> {
 }
 
 /// An atomic acknowledge cell, use to ensure an element has been read.
-struct AckCell<T: Clone + std::fmt::Debug + tracing::Value> {
+struct AckCell<T: TBound> {
     elem: std::mem::MaybeUninit<T>,
     ack: sync::atomic::AtomicBool,
 }
 
-unsafe impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Send for MqSender<T> {}
-unsafe impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Sync for MqSender<T> {}
+unsafe impl<T: TBound> Send for MqSender<T> {}
+unsafe impl<T: TBound> Sync for MqSender<T> {}
 
-unsafe impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Send for MqReceiver<T> {}
-unsafe impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Sync for MqReceiver<T> {}
+unsafe impl<T: TBound> Send for MqReceiver<T> {}
+unsafe impl<T: TBound> Sync for MqReceiver<T> {}
 
-unsafe impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> Send for MqGuard<'a, T> {}
-unsafe impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> Sync for MqGuard<'a, T> {}
+unsafe impl<T: TBound> Send for MqGuard<'_, T> {}
+unsafe impl<T: TBound> Sync for MqGuard<'_, T> {}
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqSender<T> {
+#[cfg(test)]
+impl<T: TBound> std::fmt::Debug for MqSender<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqSender").field("queue", &self.queue).finish()
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqReceiver<T> {
+#[cfg(test)]
+impl<T: TBound> std::fmt::Debug for MqReceiver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqSender").field("queue", &self.queue).finish()
     }
 }
 
-impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MqGuard<'a, T> {
+#[cfg(test)]
+impl<T: TBound> std::fmt::Debug for MqGuard<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MqGuard").field("ack", &self.ack).field("elem", &self.read()).finish()
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for MessageQueue<T> {
+#[cfg(test)]
+impl<T: TBound> std::fmt::Debug for MessageQueue<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let senders = self.senders.load(sync::atomic::Ordering::Acquire);
         let read_write = self.read_write.load(sync::atomic::Ordering::Acquire);
@@ -94,7 +115,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> std::fmt::Debug for Mes
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MqSender<T> {
+impl<T: TBound> Drop for MqSender<T> {
     fn drop(&mut self) {
         if !self.close.load(sync::atomic::Ordering::Acquire) {
             self.queue.sender_unregister();
@@ -106,14 +127,13 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MqSender<T> {
                     notify.notify();
                 }
             }
-            // self.wake.notify();
             #[cfg(not(feature = "loom"))]
             self.wake.notify_waiters();
         }
     }
 }
 
-impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MqGuard<'a, T> {
+impl<T: TBound> Drop for MqGuard<'_, T> {
     fn drop(&mut self) {
         // If the element was not acknowledged, we add it back to the queue to be picked up again,
         // taking special care to drop the element in the process. We do not need to do this if the
@@ -135,10 +155,11 @@ impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MqGuard<'a
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MessageQueue<T> {
+impl<T: TBound> Drop for MessageQueue<T> {
     fn drop(&mut self) {
         let raw_bytes = self.read_write.swap(0, sync::atomic::Ordering::Release);
 
+        // Cast to u64 to avoid overflow
         let read_indx = get_read_indx(raw_bytes) as u64;
         let read_size = get_read_size(raw_bytes) as u64;
         let stop = read_indx + read_size;
@@ -152,9 +173,9 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> Drop for MessageQueue<T
     }
 }
 
-#[tracing::instrument]
-pub fn channel<T: Send + Clone + std::fmt::Debug + tracing::Value>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
-    tracing::debug!("Creating new channel");
+#[cfg_attr(test, tracing::instrument)]
+pub fn channel<T: TBound>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
+    debug!("Creating new channel");
 
     let queue_s = sync::Arc::new(MessageQueue::new(cap));
     let queue_r = sync::Arc::clone(&queue_s);
@@ -173,7 +194,7 @@ pub fn channel<T: Send + Clone + std::fmt::Debug + tracing::Value>(cap: u16) -> 
     (sx, rx)
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqSender<T> {
+impl<T: TBound> MqSender<T> {
     fn new(
         queue: sync::Arc<MessageQueue<T>>,
         #[cfg(feature = "loom")] wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
@@ -192,18 +213,18 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqSender<T> {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub fn send(&self, elem: T) -> Option<T> {
-        tracing::debug!("Trying to send value");
+        debug!("Trying to send value");
         match self.queue.write(elem) {
             // Failed to write to the queue. This can happen if the next element right after the
             // write region has been read but not acknowledge yet.
             Some(elem) => {
-                tracing::debug!("Failed to send value");
+                debug!("Failed to send value");
                 Some(elem)
             }
             None => {
-                tracing::debug!("Value sent successfully");
+                debug!("Value sent successfully");
 
                 #[cfg(feature = "loom")]
                 {
@@ -212,7 +233,6 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqSender<T> {
                         notify.notify();
                     }
                 }
-                // self.wake.notify();
                 #[cfg(not(feature = "loom"))]
                 self.wake.notify_one();
 
@@ -232,23 +252,17 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqSender<T> {
                 notify.notify();
             }
         }
-        // self.wake.notify();
         #[cfg(not(feature = "loom"))]
         self.wake.notify_waiters();
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
-    #[cfg(feature = "loom")]
+impl<T: TBound> MqReceiver<T> {
     fn new(
         queue: sync::Arc<MessageQueue<T>>,
-        wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
+        #[cfg(feature = "loom")] wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
+        #[cfg(not(feature = "loom"))] wake: sync::Arc<Notify>,
     ) -> Self {
-        Self { queue, wake }
-    }
-
-    #[cfg(not(feature = "loom"))]
-    fn new(queue: sync::Arc<MessageQueue<T>>, wake: sync::Arc<Notify>) -> Self {
         Self { queue, wake }
     }
 
@@ -259,23 +273,23 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
         Self { queue: sync::Arc::clone(&self.queue), wake: sync::Arc::clone(&self.wake) }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub async fn recv(&self) -> Option<MqGuard<T>> {
-        tracing::debug!("Trying to receive value");
+        debug!("Trying to receive value");
         loop {
             match self.queue.read() {
                 Some(cell_ptr) => {
                     let guard = MqGuard::new(sync::Arc::clone(&self.queue), cell_ptr);
-                    tracing::debug!(elem = guard.read(), "Received value");
+                    debug!(elem = ?guard.read(), "Received value");
                     break Some(guard);
                 }
                 None => {
-                    tracing::debug!("Failed to receive value");
+                    debug!("Failed to receive value");
                     if !self.queue.sender_available() && self.queue.read_size() == 0 {
-                        tracing::debug!("No sender available");
+                        debug!("No sender available");
                         break None;
                     } else {
-                        tracing::debug!("Waiting for a send");
+                        debug!("Waiting for a send");
 
                         #[cfg(feature = "loom")]
                         {
@@ -283,18 +297,17 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
                             let len = lock.len();
                             let notify = lock.pop_front().unwrap();
 
-                            tracing::debug!(len, "Retrieved notifier");
+                            debug!(len, "Retrieved notifier");
 
                             lock.push_back(sync::Arc::clone(&notify));
                             drop(lock);
 
                             notify.wait();
                         }
-                        // self.wake.wait();
                         #[cfg(not(feature = "loom"))]
                         self.wake.notified().await;
 
-                        tracing::debug!("A send was detected");
+                        debug!("A send was detected");
                     }
                 }
             }
@@ -302,8 +315,8 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MqReceiver<T> {
     }
 }
 
-impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> MqGuard<'a, T> {
-    pub fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: std::ptr::NonNull<AckCell<T>>) -> Self {
+impl<T: TBound> MqGuard<'_, T> {
+    fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: std::ptr::NonNull<AckCell<T>>) -> Self {
         MqGuard { ack: false, queue, cell_ptr, _phantom: std::marker::PhantomData }
     }
 
@@ -371,14 +384,13 @@ impl<'a, T: Send + Clone + std::fmt::Debug + tracing::Value> MqGuard<'a, T> {
     }
 }
 
-impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
+impl<T: TBound> MessageQueue<T> {
     #[tracing::instrument]
     fn new(cap: u16) -> Self {
-        assert_ne!(std::mem::size_of::<T>(), 0, "T cannot be a ZST");
         assert!(cap > 0, "Tried to create a message queue with a capacity < 1");
 
         let cap = cap.checked_next_power_of_two().expect("failed to retrieve the next power of 2 to cap");
-        tracing::debug!(cap, "Determining array layout");
+        debug!(cap, "Determining array layout");
         let layout = alloc::Layout::array::<AckCell<T>>(cap as usize).unwrap();
 
         // From the `Layout` docs: "All layouts have an associated size and a power-of-two alignment.
@@ -387,7 +399,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         //
         // I could not find anything in the source code of this method that checks that so making
         // sure here, is this really necessary?
-        assert!(layout.size() <= std::isize::MAX as usize);
+        assert!(layout.size() <= isize::MAX as usize);
 
         let ptr = unsafe { alloc::alloc(layout) };
         let ring = match std::ptr::NonNull::new(ptr as *mut AckCell<T>) {
@@ -401,17 +413,17 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         Self { ring, cap, senders, read_write }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn sender_register(&self) {
         let senders = self.senders.fetch_add(1, sync::atomic::Ordering::AcqRel);
-        tracing::debug!(senders = senders + 1, "Increasing sender count");
+        debug!(senders = senders + 1, "Increasing sender count");
         debug_assert_ne!(senders, usize::MAX);
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn sender_unregister(&self) {
         let senders = self.senders.fetch_sub(1, sync::atomic::Ordering::AcqRel);
-        tracing::debug!(senders = senders - 1, "Decreasing sender count");
+        debug!(senders = senders - 1, "Decreasing sender count");
         debug_assert_ne!(senders, 0);
     }
 
@@ -420,10 +432,10 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         debug_assert_ne!(senders, 0);
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn sender_available(&self) -> bool {
         let senders = self.senders.load(sync::atomic::Ordering::Acquire);
-        tracing::debug!(senders, "Senders available");
+        debug!(senders, "Senders available");
         senders > 0
     }
 
@@ -443,7 +455,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         get_read_size(self.read_write.load(sync::atomic::Ordering::Acquire))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn read(&self) -> Option<std::ptr::NonNull<AckCell<T>>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::SeqCst);
         loop {
@@ -451,7 +463,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
             let writ_size = get_writ_size(raw_bytes);
             let read_indx = get_read_indx(raw_bytes);
             let read_size = get_read_size(raw_bytes);
-            tracing::debug!(writ_indx, writ_size, read_indx, read_size, "Trying to read from buffer");
+            debug!(writ_indx, writ_size, read_indx, read_size, "Trying to read from buffer");
 
             if read_size == 0 {
                 // Note that we do not try to grow the read region in case there is nothing left to
@@ -459,10 +471,10 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                 // been read, we do not store any extra information concerning their write status.
                 // Instead, it is the responsibility of the queue to grow the read region whenever
                 // it writes a new value.
-                tracing::debug!("Failed to read from buffer");
+                debug!("Failed to read from buffer");
                 break None;
             } else {
-                tracing::debug!(read_indx, "Reading from buffer");
+                debug!(read_indx, "Reading from buffer");
 
                 let read_indx_new = fast_mod(read_indx + 1, self.cap);
                 let raw_bytes_new = get_raw_bytes(writ_indx, writ_size, read_indx_new, read_size - 1);
@@ -506,12 +518,12 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                     sync::atomic::Ordering::Release,
                     sync::atomic::Ordering::Acquire,
                 ) {
-                    tracing::debug!(bytes, "Inter-thread update on read region, trying again");
+                    debug!(bytes, "Inter-thread update on read region, trying again");
                     raw_bytes = bytes;
                     continue;
                 };
 
-                tracing::debug!(
+                debug!(
                     writ_indx,
                     writ_size,
                     read_idx = read_indx_new,
@@ -523,7 +535,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn write(&self, elem: T) -> Option<T> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
         loop {
@@ -531,7 +543,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
             let writ_size = get_writ_size(raw_bytes);
             let read_indx = get_read_indx(raw_bytes);
             let read_size = get_read_size(raw_bytes);
-            tracing::debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
+            debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
 
             if writ_size == 0 {
                 if let Ok(bytes) = self.grow(raw_bytes) {
@@ -539,10 +551,10 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                     continue;
                 }
 
-                tracing::debug!("Failed to grow write region");
+                debug!("Failed to grow write region");
                 break Some(elem);
             } else {
-                tracing::debug!(writ_indx, "Writing to buffer");
+                debug!(writ_indx, "Writing to buffer");
 
                 // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
                 // whatever happens size > 0
@@ -555,12 +567,12 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
                     sync::atomic::Ordering::Release,
                     sync::atomic::Ordering::Acquire,
                 ) {
-                    tracing::debug!(bytes, "Inter-thread update on write region, trying again");
+                    debug!(bytes, "Inter-thread update on write region, trying again");
                     raw_bytes = bytes;
                     continue;
                 };
 
-                tracing::debug!(
+                debug!(
                     writ_indx = writ_indx_new,
                     writ_size = writ_size - 1,
                     read_indx,
@@ -647,7 +659,7 @@ impl<T: Send + Clone + std::fmt::Debug + tracing::Value> MessageQueue<T> {
     }
 }
 
-impl<T: Clone + std::fmt::Debug + tracing::Value> AckCell<T> {
+impl<T: TBound> AckCell<T> {
     fn new(elem: T) -> Self {
         Self { elem: std::mem::MaybeUninit::new(elem), ack: sync::atomic::AtomicBool::new(false) }
     }
@@ -673,86 +685,84 @@ fn get_read_size(raw_bytes: u64) -> u16 {
     (raw_bytes & READ_SIZE_MASK) as u16
 }
 
-#[tracing::instrument(skip_all)]
+#[cfg_attr(test, tracing::instrument(skip_all))]
 fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16) -> u64 {
-    (writ_indx as u64) << 48 | (writ_size as u64) << 32 | (read_indx as u64) << 16 | read_size as u64
+    ((writ_indx as u64) << 48) | ((writ_size as u64) << 32) | ((read_indx as u64) << 16) | read_size as u64
 }
 
+/// [loom] is a deterministic concurrent permutation simulator. From the loom docs:
+///
+/// > _"At a high level, it runs tests many times, permuting the possible concurrent executions of
+/// > each test according to what constitutes valid executions under the C11 memory model. It then
+/// > uses state reduction techniques to avoid combinatorial explosion of the number of possible
+/// > executions."_
+///
+/// # Running Loom
+///
+/// To run the tests below, first enter:
+///
+/// ```bash
+/// LOOM_LOCATION=1 \
+///     LOOM_CHECKPOINT_INTERVAL=1 \
+///     LOOM_CHECKPOINT_FILE=test_name.json \
+///     cargo test test_name --release --features loom
+/// ```
+///
+/// This will begin by running loom with no logs, checking all possible permutations of
+/// multithreaded operations for our program (actually this tests _most_ permutations, with
+/// limitations in regard to [SeqCst] and [Relaxed] ordering, but since we do not use those loom
+/// will be exploring the full concurrent permutations). If an invariant is violated, this will
+/// cause the test to fail and the fail state will be saved under `LOOM_CHECKPOINT_FILE`.
+///
+/// > We do not enable logs for this first run as loom might simulate many thousand permutations
+/// > before finding a single failing case, and this would polute `stdout`. Also, we run in
+/// > `release` mode to make this process faster.
+///
+/// Once a failing case has been identified, resume the tests with:
+///
+/// ```bash
+/// LOOM_LOG=debug \
+///     LOOM_LOCATION=1 \
+///     LOOM_CHECKPOINT_INTERVAL=1 \
+///     LOOM_CHECKPOINT_FILE=test_name.json \
+///     cargo test test_name --release --features loom
+/// ```
+///
+/// This will resume testing with the previously failing case. We enable logging this time as only a
+/// single iteration of the test will be run before the failure is caught.
+///
+/// > Note that if ever you update the code of a test, you will then need to delete
+/// > `LOOM_CHECKPOINT_FILE` before running the tests again. Otherwise loom will complain about
+// > having reached an unexpected execution path.
+///
+/// # Complexity explosion
+///
+/// Due to the way in which loom checks for concurrent access permutations, execution time will grow
+/// exponentially with the size of the model. For this reason, it might be necessary to limit the
+/// breath of checks done by loom.
+///
+/// ```bash
+/// LOOM_MAX_PREEMPTIONS=3 \
+///     LOOM_LOCATION=1 \
+///     LOOM_CHECKPOINT_INTERVAL=1 \
+///     LOOM_CHECKPOINT_FILE=test_name.json \
+///     cargo test test_name --release --features loom
+/// ```
+///
+/// From the loom docs:
+///
+/// > _"you may need to not run an exhaustive check, and instead tell loom to prune out
+/// > interleavings that are unlikely to reveal additional bugs. You do this by providing loom with
+/// > a thread pre-emption bound. If you set such a bound, loom will check all possible executions
+/// > that include at most n thread pre-emptions (where one thread is forcibly stopped and another
+/// > one runs in its place. In practice, setting the thread pre-emption bound to 2 or 3 is enough
+/// > to catch most bugs while significantly reducing the number of possible executions."_
+///
+/// [SeqCst]: std::sync::atomic::Ordering::SeqCst
+/// [Relaxed]: std::sync::atomic::Ordering::Relaxed
 #[cfg(all(test, feature = "loom"))]
 mod test_loom {
     use super::*;
-
-    /// [loom] is a deterministic concurrent permutation simulator. From the loom docs:
-    ///
-    /// > _"At a high level, it runs tests many times, permuting the possible concurrent executions
-    /// > of each test according to what constitutes valid executions under the C11 memory model. It
-    /// > then uses state reduction techniques to avoid combinatorial explosion of the number of
-    /// > possible executions."_
-    ///
-    /// # Running Loom
-    ///
-    /// To run the tests below, first enter:
-    ///
-    /// ```bash
-    /// LOOM_LOCATION=1 \
-    ///     LOOM_CHECKPOINT_INTERVAL=1 \
-    ///     LOOM_CHECKPOINT_FILE=test_name.json \
-    ///     cargo test test_name --release --features loom
-    /// ```
-    ///
-    /// This will begin by running loom with no logs, checking all possible permutations of
-    /// multithreaded operations for our program (actually this tests _most_ permutations, with
-    /// limitations in regard to [SeqCst] and [Relaxed] ordering, but since we do not use those loom
-    /// will be exploring the full concurrent permutations). If an invariant is violated, this will
-    /// cause the test to fail and the fail state will be saved under `LOOM_CHECKPOINT_FILE`.
-    ///
-    /// > We do not enable logs for this first run as loom might simulate many thousand permutations
-    /// > before finding a single failing case, and this would polute `stdout`. Also, we run in
-    /// > `release` mode to make this process faster.
-    ///
-    /// Once a failing case has been identified, resume the tests with:
-    ///
-    /// ```bash
-    /// LOOM_LOG=debug \
-    ///     LOOM_LOCATION=1 \
-    ///     LOOM_CHECKPOINT_INTERVAL=1 \
-    ///     LOOM_CHECKPOINT_FILE=test_name.json \
-    ///     cargo test test_name --release --features loom
-    /// ```
-    ///
-    /// This will resume testing with the previously failing case. We enable logging this time as
-    /// only a single iteration of the test will be run before the failure is caught.
-    ///
-    /// > Note that if ever you update the code of a test, you will then need to delete
-    /// > `LOOM_CHECKPOINT_FILE` before running the tests again. Otherwise loom will complain about
-    /// > having reached an unexpected execution path.
-    ///
-    /// # Complexity explosion
-    ///
-    /// Due to the way in which loom checks for concurrent access permutations, execution time will
-    /// grow exponentially with the size of the model. For this reason, it might be necessary to
-    /// limit the breath of checks done by loom.
-    ///
-    /// ```bash
-    /// LOOM_MAX_PREEMPTIONS=3 \
-    ///     LOOM_LOCATION=1 \
-    ///     LOOM_CHECKPOINT_INTERVAL=1 \
-    ///     LOOM_CHECKPOINT_FILE=test_name.json \
-    ///     cargo test test_name --release --features loom
-    /// ```
-    ///
-    /// From the loom docs:
-    ///
-    /// > _"you may need to not run an exhaustive check, and instead tell loom to prune out
-    /// > interleavings that are unlikely to reveal additional bugs. You do this by providing loom
-    /// > with a thread pre-emption bound. If you set such a bound, loom will check all possible
-    /// > executions that include at most n thread pre-emptions (where one thread is forcibly
-    /// > stopped and another one runs in its place. In practice, setting the thread pre-emption
-    /// > bound to 2 or 3 is enough to catch most bugs while significantly reducing the number of
-    /// > possible executions."_
-    ///
-    /// [SeqCst]: std::sync::atomic::Ordering::SeqCst
-    /// [Relaxed]: std::sync::atomic::Ordering::Relaxed
 
     /// Single Producer Single Consumer, one message
     #[test]
