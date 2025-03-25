@@ -1000,7 +1000,7 @@ mod test_loom {
                     assert_matches::assert_matches!(
                         sx1.send(i),
                         None,
-                        "Failed to send 42, message queue is {:#?}",
+                        "Failed to send {i}, message queue is {:#?}",
                         sx1.queue
                     )
                 }
@@ -1026,7 +1026,7 @@ mod test_loom {
                     assert_matches::assert_matches!(
                         sx2.send(i),
                         None,
-                        "Failed to send 42, message queue is {:#?}",
+                        "Failed to send {i}, message queue is {:#?}",
                         sx2.queue
                     )
                 }
@@ -1068,20 +1068,20 @@ mod test_loom {
                     assert_matches::assert_matches!(
                         sx.send(()),
                         None,
-                        "Failed to send 42, message queue is {:#?}",
+                        "Failed to send, message queue is {:#?}",
                         sx.queue
                     )
                 }
             });
 
             loom::future::block_on(async move {
-                for i in 0..2 {
+                for _ in 0..2 {
                     tracing::info!("Waiting for element");
                     let guard = rx.recv().await;
                     assert_matches::assert_matches!(
                         guard,
                         Some(guard) => { assert_eq!(guard.read_acknowledge(), ()); },
-                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                        "Failed to acquire acknowledge guard, message queue is {:#?}",
                         rx.queue
                     );
                 }
@@ -1095,8 +1095,57 @@ mod test_loom {
         })
     }
 
-    // TEST: overflow
+    #[test]
+    fn fail_send() {
+        loom::model(|| {
+            let (sx1, rx) = channel(2);
+            let sx2 = sx1.resubscribe();
+
+            assert_eq!(sx1.queue.writ_indx(), 0);
+            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+            assert_eq!(sx1.queue.read_indx(), 0);
+            assert_eq!(sx1.queue.read_size(), 0);
+
+            loom::thread::spawn(move || {
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx1.send(i),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx1.queue
+                    )
+                }
+            })
+            .join()
+            .unwrap();
+
+            loom::thread::spawn(move || {
+                tracing::info!("Sending element");
+                assert_matches::assert_matches!(sx2.send(3), Some(3), "Queue should be full! {:#?}", sx2.queue)
+            })
+            .join()
+            .unwrap();
+
+            loom::future::block_on(async move {
+                for i in 0..2 {
+                    tracing::info!(i, "Waiting for element");
+                    let guard = rx.recv().await;
+                    assert_matches::assert_matches!(
+                        guard,
+                        Some(guard) => { assert_eq!(guard.read_acknowledge(), i); },
+                        "Failed to acquire acknowledge guard, message queue is {:#?}",
+                        rx.queue
+                    );
+                }
+
+                tracing::info!(?rx, "Checking close correctness");
+                let guard = rx.recv().await;
+                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+            });
+        })
+    }
+
     // TEST: drop count
-    // TEST: failure conditions
     // TEST: proptest
 }
