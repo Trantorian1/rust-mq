@@ -456,6 +456,7 @@ impl<T: TBound> MessageQueue<T> {
         get_read_size(self.read_write.load(sync::atomic::Ordering::Acquire))
     }
 
+    // TODO: can we grow the write region here too?
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn read(&self) -> Option<std::ptr::NonNull<AckCell<T>>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::SeqCst);
@@ -762,7 +763,7 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
 /// [SeqCst]: std::sync::atomic::Ordering::SeqCst
 /// [Relaxed]: std::sync::atomic::Ordering::Relaxed
 #[cfg(all(test, feature = "loom"))]
-mod test_loom {
+mod threadtesting {
     use super::*;
 
     /// Single Producer Single Consumer, one message
@@ -1148,4 +1149,281 @@ mod test_loom {
 
     // TEST: drop count
     // TEST: proptest
+}
+
+#[cfg(all(test, feature = "proptest"))]
+mod protesting {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest_state_machine::*;
+
+    prop_state_machine! {
+        #![proptest_config(ProptestConfig {
+            // Enable verbose mode to make the state machine test print the
+            // transitions for each case.
+            verbose: 1,
+            // The number of tests which need to be valid for this to pass.
+            cases: 256,
+            // Max duration (in milliseconds) for each generated case.
+            timeout: 1_000,
+            ..Default::default()
+        })]
+
+        #[test]
+        fn mq_proptest(sequential 1..512 => SystemUnderTest);
+    }
+
+    #[derive(thiserror::Error, Debug)]
+    enum PropError {
+        #[error("Failed to shrink region, no space left")]
+        Shrink,
+        #[error("Failed to grow region, no space left")]
+        Grow,
+    }
+
+    struct SystemUnderTest {
+        sxs: std::collections::VecDeque<MqSender<u32>>,
+        rxs: std::collections::VecDeque<MqReceiver<u32>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Reference {
+        // FIFO, push-front pop-back
+        backlog: std::collections::VecDeque<u32>,
+        read: ReferenceRegion,
+        writ: ReferenceRegion,
+        next: u32,
+        count_sx: usize,
+        count_rx: usize,
+        cap: u16,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReferenceRegion {
+        start: u16,
+        size: u16,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Transition {
+        Send(u32),
+        Recv(Option<u32>),
+        ResubscribeSender,
+        ResubscribeReceiver,
+        DropSender,
+        DropReceiver,
+    }
+
+    impl ReferenceStateMachine for Reference {
+        type State = Self;
+        type Transition = Transition;
+
+        fn init_state() -> BoxedStrategy<Self::State> {
+            (1..512u16).prop_map(|cap| Self::new(cap)).boxed()
+        }
+
+        fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
+            prop_oneof![
+                1 => Just(Transition::Send(state.next)),
+                1 => Just(Transition::Recv(state.backlog.back().copied())),
+            ]
+            .boxed()
+        }
+
+        fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
+            match transition {
+                Transition::Send(elem) => {
+                    if state.count_sx != 0 {
+                        state
+                            .clone()
+                            .write(*elem)
+                            .map(|mut state| {
+                                state.next += 1;
+                                state
+                            })
+                            .unwrap_or(state)
+                    } else {
+                        state
+                    }
+                }
+                Transition::Recv(_) => {
+                    if state.count_rx != 0 {
+                        state.clone().read().unwrap_or(state)
+                    } else {
+                        state
+                    }
+                }
+                Transition::ResubscribeSender => {
+                    state.count_sx += 1;
+                    state
+                }
+                Transition::ResubscribeReceiver => {
+                    state.count_rx += 1;
+                    state
+                }
+                Transition::DropSender => {
+                    state.count_sx = state.count_sx.saturating_sub(1);
+                    state
+                }
+                Transition::DropReceiver => {
+                    state.count_rx = state.count_rx.saturating_sub(1);
+                    state
+                }
+            }
+        }
+    }
+
+    impl StateMachineTest for SystemUnderTest {
+        type SystemUnderTest = Self;
+        type Reference = Reference;
+
+        fn init_test(ref_state: &<Self::Reference as ReferenceStateMachine>::State) -> Self::SystemUnderTest {
+            let (sx, rx) = channel(ref_state.cap);
+            Self { sxs: std::collections::VecDeque::from([sx]), rxs: std::collections::VecDeque::from([rx]) }
+        }
+
+        fn apply(
+            mut state: Self::SystemUnderTest,
+            ref_state: &<Self::Reference as ReferenceStateMachine>::State,
+            transition: <Self::Reference as ReferenceStateMachine>::Transition,
+        ) -> Self::SystemUnderTest {
+            match transition {
+                Transition::Send(elem) => {
+                    if let Some(sx) = state.sxs.pop_back() {
+                        let res = sx.send(elem);
+
+                        match ref_state.can_write() {
+                            Ok(_) => assert_eq!(res, None),
+                            Err(PropError::Shrink) | Err(PropError::Grow) => {
+                                assert_matches::assert_matches!(res, Some(e) => { assert_eq!(e, elem) });
+                            }
+                        }
+
+                        assert_eq!(sx.queue.writ_indx(), ref_state.writ.start);
+                        assert_eq!(sx.queue.writ_size(), ref_state.writ.size);
+                        assert_eq!(sx.queue.read_indx(), ref_state.read.start);
+                        assert_eq!(sx.queue.read_size(), ref_state.read.size);
+
+                        state.sxs.push_front(sx);
+                    }
+
+                    state
+                }
+                Transition::Recv(elem) => {
+                    if let Some(rx) = state.rxs.pop_back() {
+                        {
+                            let res = tokio_test::task::spawn(rx.recv()).poll();
+
+                            match ref_state.can_read() {
+                                Ok(_) => {
+                                    assert_matches::assert_matches!(res, std::task::Poll::Ready(Some(e)) => {
+                                        assert_eq!(e.read_acknowledge(), elem.unwrap())
+                                    });
+                                }
+                                Err(PropError::Shrink) => {
+                                    assert_matches::assert_matches!(res, std::task::Poll::Pending);
+                                }
+                                _ => unreachable!("growing write region during a read is not implemented yet"),
+                            }
+                        }
+
+                        assert_eq!(rx.queue.writ_indx(), ref_state.writ.start);
+                        assert_eq!(rx.queue.writ_size(), ref_state.writ.size);
+                        assert_eq!(rx.queue.read_indx(), ref_state.read.start);
+                        assert_eq!(rx.queue.read_size(), ref_state.read.size);
+
+                        state.rxs.push_front(rx);
+                    }
+
+                    state
+                }
+                Transition::ResubscribeSender => todo!(),
+                Transition::ResubscribeReceiver => todo!(),
+                Transition::DropSender => todo!(),
+                Transition::DropReceiver => todo!(),
+            }
+        }
+    }
+
+    impl Reference {
+        fn new(cap: u16) -> Self {
+            Self {
+                backlog: Default::default(),
+                read: ReferenceRegion::new_read(),
+                writ: ReferenceRegion::new_write(cap),
+                next: 0,
+                count_sx: 1,
+                count_rx: 1,
+                cap,
+            }
+        }
+
+        fn can_read(&self) -> Result<(), PropError> {
+            self.read.can_shrink()
+        }
+
+        fn read(mut self) -> Result<Self, PropError> {
+            self.can_read().map(|_| {
+                // TODO: need to impl growing as part of reception, else we don't have a good way
+                // to test this in proptest
+                self.read.shrink(self.cap);
+                self.backlog.pop_back();
+                self
+            })
+        }
+
+        fn can_write(&self) -> Result<(), PropError> {
+            self.writ.can_shrink().and_then(|_| self.read.can_grow(self.cap))
+        }
+
+        fn write(mut self, elem: u32) -> Result<Self, PropError> {
+            self.can_write().map(|_| {
+                self.writ.shrink(self.cap);
+                self.read.grow(self.cap);
+                self.backlog.push_front(elem);
+                self
+            })
+        }
+    }
+
+    impl ReferenceRegion {
+        fn new_read() -> Self {
+            Self { start: 0, size: 0 }
+        }
+
+        fn new_write(cap: u16) -> Self {
+            Self { start: 0, size: cap }
+        }
+
+        fn len(&self) -> u16 {
+            self.size
+        }
+
+        fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        fn is_full(&self, cap: u16) -> bool {
+            self.size == cap
+        }
+
+        fn can_shrink(&self) -> Result<(), PropError> {
+            if self.is_empty() { Err(PropError::Shrink) } else { Ok(()) }
+        }
+
+        fn shrink(&mut self, cap: u16) {
+            debug_assert!(self.can_shrink().is_ok());
+            self.start = (self.start + 1) % cap;
+            self.size -= 1;
+        }
+
+        fn can_grow(&self, cap: u16) -> Result<(), PropError> {
+            if self.is_full(cap) { Err(PropError::Grow) } else { Ok(()) }
+        }
+
+        fn grow(&mut self, cap: u16) {
+            debug_assert!(self.can_grow(cap).is_ok());
+            self.size += 1;
+        }
+    }
 }
