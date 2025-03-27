@@ -985,6 +985,59 @@ mod threadtesting {
     }
 
     #[test]
+    fn resend() {
+        loom::model(|| {
+            let (sx1, rx) = channel(2);
+
+            assert_eq!(sx1.queue.writ_indx(), 0);
+            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+            assert_eq!(sx1.queue.read_indx(), 0);
+            assert_eq!(sx1.queue.read_size(), 0);
+
+            let handle = loom::thread::spawn(move || {
+                // Notice that we only send ONE element!
+                tracing::info!("Sending element");
+                assert_matches::assert_matches!(
+                    sx1.send(69),
+                    None,
+                    "Failed to send 69, message queue is {:#?}",
+                    sx1.queue
+                )
+            });
+
+            loom::future::block_on(async move {
+                // We receive the element once but we do not acknowledge it, so it is added back to
+                // the queue.
+                tracing::info!("Waiting for element");
+                let guard = rx.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read(), 69); },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx.queue
+                );
+
+                // We receive the element a second time and we acknowledge it...
+                tracing::info!("Waiting for element");
+                let guard = rx.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read_acknowledge(), 69); },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx.queue
+                );
+
+                // ...so that the queue is now empty.
+                tracing::info!("Checking close correctness");
+                let guard = rx.recv().await;
+                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+            });
+
+            handle.join().unwrap();
+        })
+    }
+
+    #[test]
     fn wrap_around() {
         loom::model(|| {
             let (sx1, rx) = channel(2);
