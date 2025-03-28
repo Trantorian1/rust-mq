@@ -29,6 +29,13 @@ macro_rules! debug {
     };
 }
 
+macro_rules! warn {
+    ($($arg:tt)+) => {
+        #[cfg(test)]
+        tracing::warn!($($arg)+)
+    };
+}
+
 #[cfg(not(test))]
 pub trait TBound: Send + Clone {}
 #[cfg(not(test))]
@@ -158,12 +165,16 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
 
 impl<T: TBound> Drop for MessageQueue<T> {
     fn drop(&mut self) {
+        warn!("Dropping message queue");
+
         let raw_bytes = self.read_write.swap(0, sync::atomic::Ordering::Release);
 
         // Cast to u64 to avoid overflow
         let read_indx = get_read_indx(raw_bytes) as u64;
         let read_size = get_read_size(raw_bytes) as u64;
         let stop = read_indx + read_size;
+
+        debug!(read_indx, read_size, stop, "Dropping elements");
 
         for i in (read_indx..stop).map(|i| fast_mod(i, self.cap)) {
             unsafe { self.ring.add(i as usize).read() };
@@ -243,6 +254,8 @@ impl<T: TBound> MqSender<T> {
     }
 
     pub fn close(self) {
+        warn!("Closing channel");
+
         self.queue.sender_unregister_all();
         let close = self.close.swap(true, sync::atomic::Ordering::AcqRel);
         let raw_bytes = self.queue.read_write.swap(0, sync::atomic::Ordering::AcqRel);
@@ -253,8 +266,10 @@ impl<T: TBound> MqSender<T> {
             let read_size = get_read_size(raw_bytes) as u64;
             let stop = read_indx + read_size;
 
+            debug!(read_indx, read_size, stop, "Dropping elements");
+
             for i in (read_indx..stop).map(|i| fast_mod(i, self.queue.cap)) {
-                unsafe { self.queue.ring.add(i as usize).read() };
+                unsafe { self.queue.ring.add(i as usize).read().elem.assume_init() };
             }
 
             #[cfg(feature = "loom")]
@@ -717,6 +732,64 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
     ((writ_indx as u64) << 48) | ((writ_size as u64) << 32) | ((read_indx as u64) << 16) | read_size as u64
 }
 
+#[cfg(test)]
+mod common {
+    #[rstest::fixture]
+    pub(crate) fn logs() {
+        let env = tracing_subscriber::EnvFilter::from_default_env();
+        let _ = tracing_subscriber::fmt::Subscriber::builder()
+            .with_env_filter(env)
+            .with_test_writer()
+            .without_time()
+            .try_init();
+    }
+
+    #[rstest::fixture]
+    pub(crate) fn model(#[default("loomtest")] path: &str, #[allow(unused)] logs: ()) -> loom::model::Builder {
+        let mut model = loom::model::Builder::new();
+        model.checkpoint_interval = 1;
+        model.checkpoint_file = Some(std::path::PathBuf::from(format!("{path}.json")));
+        model.location = true;
+        model
+    }
+
+    #[rstest::fixture]
+    pub(crate) fn model_bounded(
+        #[allow(unused)]
+        #[default("loomtest")]
+        path: &str,
+        #[with(path)] mut model: loom::model::Builder,
+    ) -> loom::model::Builder {
+        model.preemption_bound = Some(3);
+        model
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct DropCounter<T: Send + Clone> {
+        elem: T,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<T: Send + Clone + std::fmt::Debug> std::fmt::Debug for DropCounter<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DropCounter").field("elem", &self.elem).finish()
+        }
+    }
+
+    impl<T: Send + Clone> Drop for DropCounter<T> {
+        fn drop(&mut self) {
+            tracing::trace!("Incrementing drop counter");
+            self.counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    impl<T: Send + Clone> DropCounter<T> {
+        pub(crate) fn new(elem: T, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { elem, counter }
+        }
+    }
+}
+
 /// [loom] is a deterministic concurrent permutation simulator. From the loom docs:
 ///
 /// > _"At a high level, it runs tests many times, permuting the possible concurrent executions of
@@ -790,27 +863,7 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
 #[cfg(all(test, feature = "loom"))]
 mod threadtesting {
     use super::*;
-
-    #[rstest::fixture]
-    fn model(#[default("loomtest")] path: &str) -> loom::model::Builder {
-        let mut model = loom::model::Builder::new();
-        model.checkpoint_interval = 1;
-        model.checkpoint_file = Some(std::path::PathBuf::from(format!("{path}.json")));
-        model.location = true;
-        model.log = true;
-        model
-    }
-
-    #[rstest::fixture]
-    fn model_bounded(
-        #[allow(unused)]
-        #[default("loomtest")]
-        path: &str,
-        #[with(path)] mut model: loom::model::Builder,
-    ) -> loom::model::Builder {
-        model.preemption_bound = Some(3);
-        model
-    }
+    use common::*;
 
     /// Single Producer Single Consumer, one message
     #[rstest::rstest]
@@ -1161,23 +1214,27 @@ mod threadtesting {
             let (sx1, rx) = channel(3);
             let sx2 = sx1.resubscribe();
 
+            let counter_dropped1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter2 = std::sync::Arc::clone(&counter_dropped1);
+            let counter3 = std::sync::Arc::clone(&counter_dropped1);
+
             assert_eq!(sx1.queue.writ_indx(), 0);
             assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
             assert_eq!(sx1.queue.read_indx(), 0);
             assert_eq!(sx1.queue.read_size(), 0);
 
             let handle1 = loom::thread::spawn(move || {
-                for _ in 0..2 {
-                    tracing::info!("Sending element");
-                    sx1.send(());
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2)));
                 }
                 sx1.close();
             });
 
             let handle2 = loom::thread::spawn(move || {
-                for _ in 0..2 {
-                    tracing::info!("Sending element");
-                    sx2.send(());
+                for i in 2..4 {
+                    tracing::info!(i, "Sending element");
+                    sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter3)));
                 }
                 sx2.close();
             });
@@ -1189,7 +1246,10 @@ mod threadtesting {
                 tracing::info!(?rx, "Checking close correctness");
                 let guard = rx.recv().await;
                 assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-            })
+
+                tracing::info!("Checking drop correctness");
+                assert_eq!(counter_dropped1.load(std::sync::atomic::Ordering::Acquire), 4)
+            });
         })
     }
 
