@@ -5,6 +5,7 @@ use loom::sync;
 #[cfg(feature = "loom")]
 use loom::sync::Notify;
 
+use core::slice;
 #[cfg(not(feature = "loom"))]
 use std::alloc;
 #[cfg(not(feature = "loom"))]
@@ -55,7 +56,7 @@ pub struct MqReceiver<T: TBound> {
 pub struct MqGuard<'a, T: TBound> {
     ack: bool,
     queue: sync::Arc<MessageQueue<T>>,
-    cell_ptr: std::ptr::NonNull<AckCell<T>>,
+    cell: AckCell<T>,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
@@ -150,7 +151,8 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
 
             // This can still fail, but without async drop there isn't really anything better we can
             // do. Should we panic?
-            self.queue.write(elem);
+            let res = self.queue.write(elem);
+            debug_assert!(res.is_none());
         }
     }
 }
@@ -316,19 +318,18 @@ impl<T: TBound> MqReceiver<T> {
 }
 
 impl<T: TBound> MqGuard<'_, T> {
-    fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: std::ptr::NonNull<AckCell<T>>) -> Self {
-        MqGuard { ack: false, queue, cell_ptr, _phantom: std::marker::PhantomData }
+    fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: AckCell<T>) -> Self {
+        MqGuard { ack: false, queue, cell: cell_ptr, _phantom: std::marker::PhantomData }
     }
 
     pub fn read(&self) -> T {
-        unsafe {
-            let cell = self.cell_ptr.as_ref();
-            cell.elem.assume_init_ref().clone()
-        }
+        unsafe { self.cell.elem.assume_init_ref().clone() }
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn read_acknowledge(self) -> T {
         let elem = self.read();
+        debug!(?elem, "Acknowledging");
         self.acknowledge();
         elem
     }
@@ -376,10 +377,9 @@ impl<T: TBound> MqGuard<'_, T> {
         // the message queue and its underlying array are not dropped and freed while or before we
         // are dropping and (potentially) freeing this element.
         unsafe {
-            let cell = self.cell_ptr.as_mut();
-            cell.elem.assume_init_drop();
-            cell.elem = std::mem::MaybeUninit::uninit();
-            cell.ack.store(true, sync::atomic::Ordering::Release);
+            self.cell.elem.assume_init_drop();
+            self.cell.elem = std::mem::MaybeUninit::uninit();
+            self.cell.ack.store(true, sync::atomic::Ordering::Release);
         }
     }
 }
@@ -458,7 +458,7 @@ impl<T: TBound> MessageQueue<T> {
 
     // TODO: can we grow the write region here too?
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    fn read(&self) -> Option<std::ptr::NonNull<AckCell<T>>> {
+    fn read(&self) -> Option<AckCell<T>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::SeqCst);
         loop {
             let writ_indx = get_writ_indx(raw_bytes);
@@ -528,15 +528,17 @@ impl<T: TBound> MessageQueue<T> {
                 debug!(
                     writ_indx,
                     writ_size,
-                    read_idx = read_indx_new,
+                    read_indx = read_indx_new,
                     read_size = read_size - 1,
                     "Updated read region"
                 );
-                break Some(unsafe { self.ring.add(read_indx as usize) });
+                break Some(unsafe { self.ring.add(read_indx as usize).read() });
             }
         }
     }
 
+    // TODO: we could make this async and wake it up as soon as an elem has been acknowledged so we
+    // can try and grow this!
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn write(&self, elem: T) -> Option<T> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
@@ -548,7 +550,7 @@ impl<T: TBound> MessageQueue<T> {
             debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
 
             if writ_size == 0 {
-                if let Ok(bytes) = self.grow(raw_bytes) {
+                if let Ok(bytes) = self.grow_write(raw_bytes) {
                     raw_bytes = bytes;
                     continue;
                 }
@@ -588,7 +590,8 @@ impl<T: TBound> MessageQueue<T> {
         }
     }
 
-    fn grow(&self, raw_bytes: u64) -> Result<u64, &'static str> {
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
+    fn grow_write(&self, raw_bytes: u64) -> Result<u64, &'static str> {
         // We are indexing the element right AFTER the end of the write region to see if we can
         // overwrite it (ie: it has been read and acknowledged)
         let writ_indx = get_writ_indx(raw_bytes);
@@ -596,6 +599,13 @@ impl<T: TBound> MessageQueue<T> {
         let read_indx = get_read_indx(raw_bytes);
         let read_size = get_read_size(raw_bytes);
         let stop = fast_mod(writ_indx + writ_size, self.cap);
+
+        if stop == read_indx && read_size != 0 {
+            debug!("Acknowledge region is empty");
+            return Err("Failed to grow write region, acknowledge region is epmty");
+        }
+
+        debug!(writ_indx, writ_size, read_indx, read_size, stop, "Trying to grow write region");
 
         // There are a few invariants which guarantee that this will never index into uninitialized
         // memory:
@@ -639,23 +649,28 @@ impl<T: TBound> MessageQueue<T> {
         //
         // This is done to avoid fragmenting the buffer and keep read and write operations simple
         // and efficient.
-        if cell.ack.load(sync::atomic::Ordering::Acquire) {
-            let raw_bytes_new = get_raw_bytes(writ_indx, writ_size + 1, read_indx, read_size);
-            debug_assert!(writ_size <= self.cap);
+        if cell.ack.load(sync::atomic::Ordering::Acquire) && writ_size != self.cap {
+            debug!("Write region is ready to grow");
 
-            // Notice that we are not re-trying this operation in case the atomic has been updated
-            // since we last loaded it. This is because we only ever call this method as part of
-            // `write` and we use the retry loop there to handle failures in `grow`.
+            let raw_bytes_new = get_raw_bytes(writ_indx, writ_size + 1, read_indx, read_size);
             match self.read_write.compare_exchange(
                 raw_bytes,
                 raw_bytes_new,
                 sync::atomic::Ordering::Release,
                 sync::atomic::Ordering::Acquire,
             ) {
-                Err(bytes) => Ok(bytes),
-                Ok(bytes) => Ok(bytes),
+                Err(bytes) => {
+                    debug!(bytes, "Failed to grow write region, cross-thread update");
+                    Ok(bytes)
+                }
+                Ok(_) => {
+                    debug!(writ_indx, writ_size = writ_size + 1, read_indx, read_size, "Managed to grow write region");
+                    Ok(raw_bytes_new)
+                }
             }
         } else {
+            debug!("Cannot grow write region");
+
             Err("Failed to grow write region, next element has not been acknowledged yet")
         }
     }
@@ -766,10 +781,31 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
 mod threadtesting {
     use super::*;
 
+    #[rstest::fixture]
+    fn model(#[default("loomtest")] path: &str) -> loom::model::Builder {
+        let mut model = loom::model::Builder::new();
+        model.checkpoint_interval = 1;
+        model.checkpoint_file = Some(std::path::PathBuf::from(format!("{path}.json")));
+        model.location = true;
+        model.log = true;
+        model
+    }
+
+    #[rstest::fixture]
+    fn model_bounded(
+        #[allow(unused)]
+        #[default("loomtest")]
+        path: &str,
+        #[with(path)] mut model: loom::model::Builder,
+    ) -> loom::model::Builder {
+        model.preemption_bound = Some(3);
+        model
+    }
+
     /// Single Producer Single Consumer, one message
-    #[test]
-    fn spsc_1() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn spsc_1(#[with("spsc_1")] model: loom::model::Builder) {
+        model.check(|| {
             let (sx, rx) = channel(1);
             let elem = 42;
 
@@ -807,9 +843,9 @@ mod threadtesting {
     }
 
     /// Single Produce Single Consumer, multiple messages
-    #[test]
-    fn spsc_2() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn spsc_2(#[with("spsc_2")] model_bounded: loom::model::Builder) {
+        model_bounded.check(|| {
             let (sx, rx) = channel(3);
 
             assert_eq!(sx.queue.writ_indx(), 0);
@@ -833,6 +869,7 @@ mod threadtesting {
                 for i in 0..2 {
                     tracing::info!(i, "Waiting for element");
                     let guard = rx.recv().await;
+                    tracing::info!(i, "Received element");
                     assert_matches::assert_matches!(
                         guard,
                         Some(guard) => { assert_eq!(guard.read_acknowledge(), i) },
@@ -850,9 +887,9 @@ mod threadtesting {
     }
 
     /// Single Producer Multiple Consumer, multiple messages
-    #[test]
-    fn spmc() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn spmc(#[with("spmc")] model_bounded: loom::model::Builder) {
+        model_bounded.check(|| {
             let (sx, rx1) = channel(3);
             let rx2 = rx1.resubscribe();
             let rx3 = rx1.resubscribe();
@@ -924,9 +961,9 @@ mod threadtesting {
     }
 
     /// Multiple Producer Multiple Consumer, multiple messages
-    #[test]
-    fn mpsc() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn mpsc(#[with("mpsc")] model_bounded: loom::model::Builder) {
+        model_bounded.check(|| {
             let (sx1, rx) = channel(3);
             let sx2 = sx1.resubscribe();
 
@@ -984,9 +1021,9 @@ mod threadtesting {
         })
     }
 
-    #[test]
-    fn resend() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn resend(#[with("resend")] model: loom::model::Builder) {
+        model.check(|| {
             let (sx1, rx) = channel(2);
 
             assert_eq!(sx1.queue.writ_indx(), 0);
@@ -1037,9 +1074,9 @@ mod threadtesting {
         })
     }
 
-    #[test]
-    fn wrap_around() {
-        loom::model(|| {
+    #[rstest::rstest]
+    fn wrap_around(#[with("wrap_around")] model_bounded: loom::model::Builder) {
+        model_bounded.check(|| {
             let (sx1, rx) = channel(2);
             let sx2 = sx1.resubscribe();
 
@@ -1064,6 +1101,7 @@ mod threadtesting {
                 for i in 0..2 {
                     tracing::info!("Waiting for element");
                     let guard = rx.recv().await;
+                    tracing::info!("Received element");
                     assert_matches::assert_matches!(
                         guard,
                         Some(guard) => { assert_eq!(guard.read_acknowledge(), i); },
@@ -1090,6 +1128,7 @@ mod threadtesting {
                 for i in 2..4 {
                     tracing::info!("Waiting for element");
                     let guard = rx.recv().await;
+                    tracing::info!("Received element");
                     assert_matches::assert_matches!(
                         guard,
                         Some(guard) => { assert_eq!(guard.read_acknowledge(), i); },
@@ -1134,7 +1173,7 @@ mod threadtesting {
                     let guard = rx.recv().await;
                     assert_matches::assert_matches!(
                         guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge(), ()); },
+                        Some(guard) => { guard.acknowledge() },
                         "Failed to acquire acknowledge guard, message queue is {:#?}",
                         rx.queue
                     );
@@ -1201,11 +1240,12 @@ mod threadtesting {
     }
 
     // TEST: drop count
+    // TEST: close
     // TEST: proptest
 }
 
 #[cfg(all(test, feature = "proptest"))]
-mod protesting {
+mod proptesting {
     use super::*;
     use proptest::prelude::*;
     use proptest_state_machine::*;
