@@ -5,7 +5,6 @@ use loom::sync;
 #[cfg(feature = "loom")]
 use loom::sync::Notify;
 
-use core::slice;
 #[cfg(not(feature = "loom"))]
 use std::alloc;
 #[cfg(not(feature = "loom"))]
@@ -244,18 +243,30 @@ impl<T: TBound> MqSender<T> {
     }
 
     pub fn close(self) {
-        self.close.store(true, sync::atomic::Ordering::Release);
         self.queue.sender_unregister_all();
+        let close = self.close.swap(true, sync::atomic::Ordering::AcqRel);
+        let raw_bytes = self.queue.read_write.swap(0, sync::atomic::Ordering::AcqRel);
 
-        #[cfg(feature = "loom")]
-        {
-            let lock = self.wake.lock().unwrap();
-            for notify in lock.iter() {
-                notify.notify();
+        if !close {
+            // Cast to u64 to avoid overflow
+            let read_indx = get_read_indx(raw_bytes) as u64;
+            let read_size = get_read_size(raw_bytes) as u64;
+            let stop = read_indx + read_size;
+
+            for i in (read_indx..stop).map(|i| fast_mod(i, self.queue.cap)) {
+                unsafe { self.queue.ring.add(i as usize).read() };
             }
+
+            #[cfg(feature = "loom")]
+            {
+                let lock = self.wake.lock().unwrap();
+                for notify in lock.iter() {
+                    notify.notify();
+                }
+            }
+            #[cfg(not(feature = "loom"))]
+            self.wake.notify_waiters();
         }
-        #[cfg(not(feature = "loom"))]
-        self.wake.notify_waiters();
     }
 }
 
@@ -429,8 +440,7 @@ impl<T: TBound> MessageQueue<T> {
     }
 
     fn sender_unregister_all(&self) {
-        let senders = self.senders.swap(0, sync::atomic::Ordering::Release);
-        debug_assert_ne!(senders, 0);
+        self.senders.store(0, sync::atomic::Ordering::Release);
     }
 
     #[cfg_attr(test, tracing::instrument(skip(self)))]
@@ -1145,6 +1155,44 @@ mod threadtesting {
         })
     }
 
+    #[rstest::rstest]
+    fn close(#[with("close")] model_bounded: loom::model::Builder) {
+        model_bounded.check(|| {
+            let (sx1, rx) = channel(3);
+            let sx2 = sx1.resubscribe();
+
+            assert_eq!(sx1.queue.writ_indx(), 0);
+            assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
+            assert_eq!(sx1.queue.read_indx(), 0);
+            assert_eq!(sx1.queue.read_size(), 0);
+
+            let handle1 = loom::thread::spawn(move || {
+                for _ in 0..2 {
+                    tracing::info!("Sending element");
+                    sx1.send(());
+                }
+                sx1.close();
+            });
+
+            let handle2 = loom::thread::spawn(move || {
+                for _ in 0..2 {
+                    tracing::info!("Sending element");
+                    sx2.send(());
+                }
+                sx2.close();
+            });
+
+            handle1.join().unwrap();
+            handle2.join().unwrap();
+
+            loom::future::block_on(async move {
+                tracing::info!(?rx, "Checking close correctness");
+                let guard = rx.recv().await;
+                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+            })
+        })
+    }
+
     #[test]
     fn zst() {
         loom::model(|| {
@@ -1240,7 +1288,6 @@ mod threadtesting {
     }
 
     // TEST: drop count
-    // TEST: close
     // TEST: proptest
 }
 
