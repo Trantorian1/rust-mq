@@ -700,18 +700,26 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
 
 #[cfg(test)]
 mod common {
+    pub(crate) type LogConfig = tracing_subscriber::fmt::SubscriberBuilder<
+        tracing_subscriber::fmt::format::DefaultFields,
+        tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, ()>,
+        tracing_subscriber::EnvFilter,
+    >;
+
     #[rstest::fixture]
-    pub(crate) fn logs() {
+    pub(crate) fn log_conf() -> LogConfig {
         let env = tracing_subscriber::EnvFilter::from_default_env();
-        let _ = tracing_subscriber::fmt::Subscriber::builder()
-            .with_env_filter(env)
-            .with_test_writer()
-            .without_time()
-            .try_init();
+        tracing_subscriber::fmt::Subscriber::builder().with_env_filter(env).without_time()
     }
 
     #[rstest::fixture]
-    pub(crate) fn model(#[default("loomtest")] path: &str, #[allow(unused)] logs: ()) -> loom::model::Builder {
+    pub(crate) fn log_stdout(log_conf: LogConfig) {
+        let _ = log_conf.with_test_writer().try_init();
+    }
+
+    #[cfg(feature = "loom")]
+    #[rstest::fixture]
+    pub(crate) fn model(#[default("loomtest")] path: &str, #[allow(unused)] log_stdout: ()) -> loom::model::Builder {
         let mut model = loom::model::Builder::new();
         model.checkpoint_interval = 1;
         model.checkpoint_file = Some(std::path::PathBuf::from(format!("{path}.json")));
@@ -719,6 +727,7 @@ mod common {
         model
     }
 
+    #[cfg(feature = "loom")]
     #[rstest::fixture]
     pub(crate) fn model_bounded(
         #[allow(unused)]
@@ -1381,6 +1390,7 @@ mod threadtesting {
 #[cfg(all(test, feature = "proptest"))]
 mod proptesting {
     use super::*;
+    use common::*;
     use proptest::prelude::*;
     use proptest_state_machine::*;
 
@@ -1509,71 +1519,112 @@ mod proptesting {
             Self { sxs: std::collections::VecDeque::from([sx]), rxs: std::collections::VecDeque::from([rx]) }
         }
 
+        #[tracing::instrument(skip(state))]
         fn apply(
             mut state: Self::SystemUnderTest,
             ref_state: &<Self::Reference as ReferenceStateMachine>::State,
             transition: <Self::Reference as ReferenceStateMachine>::Transition,
         ) -> Self::SystemUnderTest {
-            match transition {
-                Transition::Send(elem) => {
-                    if let Some(sx) = state.sxs.pop_back() {
-                        let res = sx.send(elem);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .append(false)
+                .create(true)
+                .open("./log")
+                .expect("Failed to open file");
+            let (appender, _guard) = tracing_appender::non_blocking(file);
+            let logger = log_conf().with_writer(appender).finish();
 
-                        match ref_state.can_write() {
-                            Ok(_) => assert_eq!(res, None),
-                            Err(PropError::Shrink) | Err(PropError::Grow) => {
-                                assert_matches::assert_matches!(res, Some(e) => { assert_eq!(e, elem) });
-                            }
-                        }
+            tracing::subscriber::with_default(logger, || {
+                tracing::warn!(?transition, "Testing...");
+                match transition {
+                    Transition::Send(elem) => {
+                        tracing::info!(elem, "Processing a SEND request");
 
-                        assert_eq!(sx.queue.writ_indx(), ref_state.writ.start);
-                        assert_eq!(sx.queue.writ_size(), ref_state.writ.size);
-                        assert_eq!(sx.queue.read_indx(), ref_state.read.start);
-                        assert_eq!(sx.queue.read_size(), ref_state.read.size);
+                        if let Some(sx) = state.sxs.pop_back() {
+                            tracing::debug!("Found a sender to process the request");
+                            let res = sx.send(elem);
 
-                        state.sxs.push_front(sx);
-                    }
-
-                    state
-                }
-                Transition::Recv(elem) => {
-                    if let Some(rx) = state.rxs.pop_back() {
-                        {
-                            let res = tokio_test::task::spawn(rx.recv()).poll();
-
-                            match ref_state.can_read() {
+                            match ref_state.can_write() {
                                 Ok(_) => {
-                                    assert_matches::assert_matches!(res, std::task::Poll::Ready(Some(e)) => {
-                                        assert_eq!(e.read_acknowledge(), elem.unwrap())
-                                    });
+                                    tracing::debug!("Write is legal");
+                                    assert_eq!(res, None);
+                                    tracing::info!("Write successful");
                                 }
-                                Err(PropError::Shrink) => {
-                                    assert_matches::assert_matches!(res, std::task::Poll::Pending);
+                                Err(PropError::Shrink) | Err(PropError::Grow) => {
+                                    tracing::debug!("Write is illegal");
+                                    assert_matches::assert_matches!(res, Some(e) => { assert_eq!(e, elem) });
+                                    tracing::info!("Write failed successfully ;)");
                                 }
-                                _ => unreachable!("growing write region during a read is not implemented yet"),
                             }
+
+                            tracing::debug!(?ref_state.writ, ?ref_state.read, "Checking read/write regions");
+
+                            assert_eq!(sx.queue.writ_indx(), ref_state.writ.start);
+                            assert_eq!(sx.queue.writ_size(), ref_state.writ.size);
+                            assert_eq!(sx.queue.read_indx(), ref_state.read.start);
+                            assert_eq!(sx.queue.read_size(), ref_state.read.size);
+
+                            tracing::trace!("Restoring sender state");
+                            state.sxs.push_front(sx);
+                        } else {
+                            tracing::debug!("No sender available");
                         }
-
-                        assert_eq!(rx.queue.writ_indx(), ref_state.writ.start);
-                        assert_eq!(rx.queue.writ_size(), ref_state.writ.size);
-                        assert_eq!(rx.queue.read_indx(), ref_state.read.start);
-                        assert_eq!(rx.queue.read_size(), ref_state.read.size);
-
-                        state.rxs.push_front(rx);
                     }
+                    Transition::Recv(elem) => {
+                        tracing::info!(elem, "Processing a DROP request");
 
-                    state
+                        if let Some(rx) = state.rxs.pop_back() {
+                            tracing::debug!("Found a receiver to process the request");
+                            {
+                                let res = tokio_test::task::spawn(rx.recv()).poll();
+
+                                match ref_state.can_read() {
+                                    Ok(_) => {
+                                        tracing::debug!("Read is legal");
+                                        assert_matches::assert_matches!(res, std::task::Poll::Ready(Some(e)) => {
+                                            assert_eq!(e.read_acknowledge(), elem.unwrap())
+                                        });
+                                        tracing::info!("Read successful");
+                                    }
+                                    Err(PropError::Shrink) => {
+                                        tracing::debug!("Read is illegal");
+                                        assert_matches::assert_matches!(res, std::task::Poll::Pending);
+                                        tracing::info!("Read failed successfully ;)");
+                                    }
+                                    _ => unreachable!("growing write region during a read is not implemented yet"),
+                                }
+                            }
+
+                            tracing::debug!(?ref_state.writ, ?ref_state.read, "Checking read/write regions");
+
+                            assert_eq!(rx.queue.writ_indx(), ref_state.writ.start);
+                            assert_eq!(rx.queue.writ_size(), ref_state.writ.size);
+                            assert_eq!(rx.queue.read_indx(), ref_state.read.start);
+                            assert_eq!(rx.queue.read_size(), ref_state.read.size);
+
+                            tracing::trace!("Restoring sender state");
+                            state.rxs.push_front(rx);
+                        } else {
+                            tracing::debug!("No receiver available");
+                        }
+                    }
+                    Transition::ResubscribeSender => todo!(),
+                    Transition::ResubscribeReceiver => todo!(),
+                    Transition::DropSender => todo!(),
+                    Transition::DropReceiver => todo!(),
                 }
-                Transition::ResubscribeSender => todo!(),
-                Transition::ResubscribeReceiver => todo!(),
-                Transition::DropSender => todo!(),
-                Transition::DropReceiver => todo!(),
-            }
+            });
+            state
         }
     }
 
     impl Reference {
-        fn new(cap: u16) -> Self {
+        #[tracing::instrument(skip(cap_base))]
+        fn new(cap_base: u16) -> Self {
+            let cap = cap_base.checked_next_power_of_two().expect("Failed to get next power of 2");
+
+            tracing::debug!(cap_base, cap, "Creating reference state");
+
             Self {
                 backlog: Default::default(),
                 read: ReferenceRegion::new_read(),
@@ -1590,35 +1641,33 @@ mod proptesting {
         }
 
         fn read(mut self) -> Result<Self, PropError> {
-            self.can_read().map(|_| {
-                // TODO: need to impl growing as part of reception, else we don't have a good way
-                // to test this in proptest
-                self.read.shrink(self.cap);
-                self.backlog.pop_back();
-                self
-            })
+            self.read.shrink(self.cap).map(|_| self.backlog.pop_back().expect("Invalid state")).map(|_| self)
         }
 
         fn can_write(&self) -> Result<(), PropError> {
-            self.writ.can_shrink().and_then(|_| self.read.can_grow(self.cap))
+            self.writ.can_shrink().or(self.writ.can_grow(self.cap)).and_then(|_| self.read.can_grow(self.cap))
         }
 
         fn write(mut self, elem: u32) -> Result<Self, PropError> {
-            self.can_write().map(|_| {
-                self.writ.shrink(self.cap);
-                self.read.grow(self.cap);
-                self.backlog.push_front(elem);
-                self
-            })
+            self.writ
+                .shrink(self.cap)
+                .or_else(|_| self.writ.grow(self.cap).and_then(|_| self.writ.shrink(self.cap)))
+                .and_then(|_| self.read.grow(self.cap))
+                .map(|_| self.backlog.push_front(elem))
+                .map(|_| self)
         }
     }
 
     impl ReferenceRegion {
+        #[tracing::instrument]
         fn new_read() -> Self {
+            tracing::debug!("Creating new read region");
             Self { start: 0, size: 0 }
         }
 
+        #[tracing::instrument]
         fn new_write(cap: u16) -> Self {
+            tracing::debug!("Creating new write region");
             Self { start: 0, size: cap }
         }
 
@@ -1638,19 +1687,19 @@ mod proptesting {
             if self.is_empty() { Err(PropError::Shrink) } else { Ok(()) }
         }
 
-        fn shrink(&mut self, cap: u16) {
-            debug_assert!(self.can_shrink().is_ok());
-            self.start = (self.start + 1) % cap;
-            self.size -= 1;
+        fn shrink(&mut self, cap: u16) -> Result<(), PropError> {
+            self.can_shrink().map(|_| {
+                self.start = (self.start + 1) % cap;
+                self.size -= 1;
+            })
         }
 
         fn can_grow(&self, cap: u16) -> Result<(), PropError> {
             if self.is_full(cap) { Err(PropError::Grow) } else { Ok(()) }
         }
 
-        fn grow(&mut self, cap: u16) {
-            debug_assert!(self.can_grow(cap).is_ok());
-            self.size += 1;
+        fn grow(&mut self, cap: u16) -> Result<(), PropError> {
+            self.can_grow(cap).map(|_| self.size += 1)
         }
     }
 }

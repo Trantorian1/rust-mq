@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 143cb6a9c009e9c14dd19a52002b35596328b8a1e40fa1ea832ddd64efea2640 # shrinks to (initial_state, transitions, seen_counter) = (Reference { backlog: [], read: ReferenceRegion { start: 0, size: 0 }, writ: ReferenceRegion { start: 0, size: 5 }, next: 0, count_sx: 1, count_rx: 1, cap: 5 }, [Send(0)], None)
