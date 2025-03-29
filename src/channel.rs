@@ -69,7 +69,7 @@ pub struct MqReceiver<T: TBound> {
 pub struct MqGuard<'a, T: TBound> {
     ack: bool,
     queue: sync::Arc<MessageQueue<T>>,
-    cell: AckCell<T>,
+    cell: &'a mut AckCell<T>,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
@@ -346,9 +346,9 @@ impl<T: TBound> MqReceiver<T> {
     }
 }
 
-impl<T: TBound> MqGuard<'_, T> {
-    fn new(queue: sync::Arc<MessageQueue<T>>, cell_ptr: AckCell<T>) -> Self {
-        MqGuard { ack: false, queue, cell: cell_ptr, _phantom: std::marker::PhantomData }
+impl<'a, T: TBound> MqGuard<'a, T> {
+    fn new(queue: sync::Arc<MessageQueue<T>>, cell: &'a mut AckCell<T>) -> Self {
+        MqGuard { ack: false, queue, cell, _phantom: std::marker::PhantomData }
     }
 
     pub fn read(&self) -> T {
@@ -447,9 +447,8 @@ impl<T: TBound> MessageQueue<T> {
         get_read_size(self.read_write.load(sync::atomic::Ordering::Acquire))
     }
 
-    // TODO: can we grow the write region here too?
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    fn read(&self) -> Option<AckCell<T>> {
+    fn read(&self) -> Option<&mut AckCell<T>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::SeqCst);
         loop {
             let writ_indx = get_writ_indx(raw_bytes);
@@ -523,7 +522,7 @@ impl<T: TBound> MessageQueue<T> {
                     read_size = read_size - 1,
                     "Updated read region"
                 );
-                break Some(unsafe { self.ring.add(read_indx as usize).read() });
+                break Some(unsafe { self.ring.add(read_indx as usize).as_mut() });
             }
         }
     }
@@ -616,6 +615,7 @@ impl<T: TBound> MessageQueue<T> {
         //
         // See the note in `MqGuard` to understand why we only read the `ack` state!
         let cell = unsafe { self.ring.add(stop as usize).as_ref() };
+        let ack = cell.ack.load(sync::atomic::Ordering::Acquire);
 
         // Why would this fail? Consider the following buffer state:
         //
@@ -640,7 +640,8 @@ impl<T: TBound> MessageQueue<T> {
         //
         // This is done to avoid fragmenting the buffer and keep read and write operations simple
         // and efficient.
-        if cell.ack.load(sync::atomic::Ordering::Acquire) && writ_size != self.cap {
+        tracing::debug!(ack, self.cap, "Checking for cell acknowledgment");
+        if ack && writ_size != self.cap {
             debug!("Write region is ready to grow");
 
             let raw_bytes_new = get_raw_bytes(writ_indx, writ_size + 1, read_indx, read_size);
@@ -767,6 +768,30 @@ mod common {
         pub(crate) fn get(self) -> T {
             self.elem.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use common::*;
+
+    /// This function makes sure that when the message queue reads from its buffer, it returns a
+    /// _reference_ to an [AckCell]. This is done so that updates to its [ack] state propagate to
+    /// the underlying memory and don't just happen on a copy.
+    ///
+    /// > This bug was found through property testing (one could think this should have been easier
+    /// > to spot :P).
+    ///
+    /// [ack]: AckCell::ack
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn ref_acknowledge(#[allow(unused)] log_stdout: ()) {
+        let (sx, rx) = channel(1);
+
+        assert_eq!(sx.send(0), None);
+        assert_eq!(rx.recv().await.unwrap().read_acknowledge(), 0);
+        assert_eq!(sx.send(1), None);
     }
 }
 
@@ -1410,7 +1435,7 @@ mod proptesting {
         fn mq_proptest(sequential 1..512 => SystemUnderTest);
     }
 
-    #[derive(thiserror::Error, Debug)]
+    #[derive(thiserror::Error, Clone, Debug)]
     enum PropError {
         #[error("Failed to shrink region, no space left")]
         Shrink,
@@ -1426,7 +1451,9 @@ mod proptesting {
     #[derive(Clone, Debug)]
     struct Reference {
         // FIFO, push-front pop-back
-        backlog: std::collections::VecDeque<u32>,
+        last_read: std::collections::VecDeque<u32>,
+        last_writ: std::collections::VecDeque<u32>,
+        status: Result<(), PropError>,
         read: ReferenceRegion,
         writ: ReferenceRegion,
         next: u32,
@@ -1444,7 +1471,7 @@ mod proptesting {
     #[derive(Clone, Debug)]
     enum Transition {
         Send(u32),
-        Recv(Option<u32>),
+        Recv,
         ResubscribeSender,
         ResubscribeReceiver,
         DropSender,
@@ -1462,7 +1489,7 @@ mod proptesting {
         fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
             prop_oneof![
                 1 => Just(Transition::Send(state.next)),
-                1 => Just(Transition::Recv(state.backlog.back().copied())),
+                1 => Just(Transition::Recv),
             ]
             .boxed()
         }
@@ -1471,21 +1498,26 @@ mod proptesting {
             match transition {
                 Transition::Send(elem) => {
                     if state.count_sx != 0 {
-                        state
-                            .clone()
-                            .write(*elem)
-                            .map(|mut state| {
-                                state.next += 1;
+                        match state.clone().write(*elem) {
+                            Ok(state_new) => state_new,
+                            Err(e) => {
+                                state.status = Err(e);
                                 state
-                            })
-                            .unwrap_or(state)
+                            }
+                        }
                     } else {
                         state
                     }
                 }
-                Transition::Recv(_) => {
+                Transition::Recv => {
                     if state.count_rx != 0 {
-                        state.clone().read().unwrap_or(state)
+                        match state.clone().read() {
+                            Ok(state_new) => state_new,
+                            Err(e) => {
+                                state.status = Err(e);
+                                state
+                            }
+                        }
                     } else {
                         state
                     }
@@ -1527,7 +1559,7 @@ mod proptesting {
         ) -> Self::SystemUnderTest {
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .append(false)
+                .append(true)
                 .create(true)
                 .open("./log")
                 .expect("Failed to open file");
@@ -1544,13 +1576,14 @@ mod proptesting {
                             tracing::debug!("Found a sender to process the request");
                             let res = sx.send(elem);
 
-                            match ref_state.can_write() {
+                            tracing::trace!(?ref_state, "Comparing to reference state");
+                            match ref_state.status {
                                 Ok(_) => {
                                     tracing::debug!("Write is legal");
                                     assert_eq!(res, None);
                                     tracing::info!("Write successful");
                                 }
-                                Err(PropError::Shrink) | Err(PropError::Grow) => {
+                                Err(_) => {
                                     tracing::debug!("Write is illegal");
                                     assert_matches::assert_matches!(res, Some(e) => { assert_eq!(e, elem) });
                                     tracing::info!("Write failed successfully ;)");
@@ -1570,28 +1603,29 @@ mod proptesting {
                             tracing::debug!("No sender available");
                         }
                     }
-                    Transition::Recv(elem) => {
-                        tracing::info!(elem, "Processing a DROP request");
+                    Transition::Recv => {
+                        tracing::info!("Processing a RECV request");
 
                         if let Some(rx) = state.rxs.pop_back() {
                             tracing::debug!("Found a receiver to process the request");
                             {
                                 let res = tokio_test::task::spawn(rx.recv()).poll();
 
-                                match ref_state.can_read() {
+                                tracing::trace!(?ref_state, "Comparing to reference state");
+                                match ref_state.status {
                                     Ok(_) => {
                                         tracing::debug!("Read is legal");
+                                        let elem = ref_state.last_read.front().copied().unwrap();
                                         assert_matches::assert_matches!(res, std::task::Poll::Ready(Some(e)) => {
-                                            assert_eq!(e.read_acknowledge(), elem.unwrap())
+                                            assert_eq!(e.read_acknowledge(), elem)
                                         });
                                         tracing::info!("Read successful");
                                     }
-                                    Err(PropError::Shrink) => {
+                                    Err(_) => {
                                         tracing::debug!("Read is illegal");
                                         assert_matches::assert_matches!(res, std::task::Poll::Pending);
                                         tracing::info!("Read failed successfully ;)");
                                     }
-                                    _ => unreachable!("growing write region during a read is not implemented yet"),
                                 }
                             }
 
@@ -1619,14 +1653,12 @@ mod proptesting {
     }
 
     impl Reference {
-        #[tracing::instrument(skip(cap_base))]
         fn new(cap_base: u16) -> Self {
             let cap = cap_base.checked_next_power_of_two().expect("Failed to get next power of 2");
-
-            tracing::debug!(cap_base, cap, "Creating reference state");
-
             Self {
-                backlog: Default::default(),
+                last_read: Default::default(),
+                last_writ: Default::default(),
+                status: Ok(()),
                 read: ReferenceRegion::new_read(),
                 writ: ReferenceRegion::new_write(cap),
                 next: 0,
@@ -1636,16 +1668,12 @@ mod proptesting {
             }
         }
 
-        fn can_read(&self) -> Result<(), PropError> {
-            self.read.can_shrink()
-        }
-
         fn read(mut self) -> Result<Self, PropError> {
-            self.read.shrink(self.cap).map(|_| self.backlog.pop_back().expect("Invalid state")).map(|_| self)
-        }
-
-        fn can_write(&self) -> Result<(), PropError> {
-            self.writ.can_shrink().or(self.writ.can_grow(self.cap)).and_then(|_| self.read.can_grow(self.cap))
+            self.read.shrink(self.cap).map(|_| {
+                self.last_read.push_front(self.last_writ.pop_back().expect("Invalid state"));
+                self.status = Ok(());
+                self
+            })
         }
 
         fn write(mut self, elem: u32) -> Result<Self, PropError> {
@@ -1653,21 +1681,21 @@ mod proptesting {
                 .shrink(self.cap)
                 .or_else(|_| self.writ.grow(self.cap).and_then(|_| self.writ.shrink(self.cap)))
                 .and_then(|_| self.read.grow(self.cap))
-                .map(|_| self.backlog.push_front(elem))
-                .map(|_| self)
+                .map(|_| {
+                    self.last_writ.push_front(elem);
+                    self.next += 1;
+                    self.status = Ok(());
+                    self
+                })
         }
     }
 
     impl ReferenceRegion {
-        #[tracing::instrument]
         fn new_read() -> Self {
-            tracing::debug!("Creating new read region");
             Self { start: 0, size: 0 }
         }
 
-        #[tracing::instrument]
         fn new_write(cap: u16) -> Self {
-            tracing::debug!("Creating new write region");
             Self { start: 0, size: cap }
         }
 
