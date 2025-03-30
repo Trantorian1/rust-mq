@@ -424,9 +424,13 @@ impl<T: TBound> MessageQueue<T> {
         self.senders.store(0, sync::atomic::Ordering::Release);
     }
 
+    fn sender_count(&self) -> usize {
+        self.senders.load(sync::atomic::Ordering::Acquire)
+    }
+
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn sender_available(&self) -> bool {
-        let senders = self.senders.load(sync::atomic::Ordering::Acquire);
+        let senders = self.sender_count();
         debug!(senders, "Senders available");
         senders > 0
     }
@@ -1488,8 +1492,10 @@ mod proptesting {
 
         fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
             prop_oneof![
-                1 => Just(Transition::Send(state.next)),
-                1 => Just(Transition::Recv),
+                2 => Just(Transition::Send(state.next)),
+                2 => Just(Transition::Recv),
+                1 => Just(Transition::ResubscribeSender),
+                1 => Just(Transition::DropSender),
             ]
             .boxed()
         }
@@ -1523,11 +1529,15 @@ mod proptesting {
                     }
                 }
                 Transition::ResubscribeSender => {
-                    state.count_sx += 1;
+                    if state.count_sx != 0 {
+                        state.count_sx += 1;
+                    }
                     state
                 }
                 Transition::ResubscribeReceiver => {
-                    state.count_rx += 1;
+                    if state.count_rx != 0 {
+                        state.count_rx += 1;
+                    }
                     state
                 }
                 Transition::DropSender => {
@@ -1601,6 +1611,8 @@ mod proptesting {
                             state.sxs.push_front(sx);
                         } else {
                             tracing::debug!("No sender available");
+                            assert_eq!(state.sxs.len(), 0);
+                            assert_eq!(ref_state.count_sx, 0);
                         }
                     }
                     Transition::Recv => {
@@ -1621,9 +1633,17 @@ mod proptesting {
                                         });
                                         tracing::info!("Read successful");
                                     }
-                                    Err(_) => {
+                                    Err(_) if ref_state.count_sx != 0 => {
                                         tracing::debug!("Read is illegal");
                                         assert_matches::assert_matches!(res, std::task::Poll::Pending);
+                                        tracing::info!("Read failed successfully ;)");
+                                    }
+                                    _ => {
+                                        tracing::debug!("Read with no senders or values");
+                                        assert_eq!(state.sxs.len(), 0);
+                                        assert_eq!(rx.queue.sender_count(), 0);
+                                        assert_eq!(ref_state.count_sx, 0);
+                                        assert_matches::assert_matches!(res, std::task::Poll::Ready(None));
                                         tracing::info!("Read failed successfully ;)");
                                     }
                                 }
@@ -1636,15 +1656,50 @@ mod proptesting {
                             assert_eq!(rx.queue.read_indx(), ref_state.read.start);
                             assert_eq!(rx.queue.read_size(), ref_state.read.size);
 
-                            tracing::trace!("Restoring sender state");
+                            tracing::trace!("Restoring receiver state");
                             state.rxs.push_front(rx);
                         } else {
                             tracing::debug!("No receiver available");
                         }
                     }
-                    Transition::ResubscribeSender => todo!(),
+                    Transition::ResubscribeSender => {
+                        tracing::info!("Processing a RESUB SEND request");
+
+                        if let Some(sx) = state.sxs.pop_back() {
+                            tracing::debug!("Found a sender for resub");
+
+                            state.sxs.push_front(sx.resubscribe());
+
+                            tracing::trace!(?ref_state, "Comparing to reference state");
+                            assert_eq!(sx.queue.sender_count(), ref_state.count_sx);
+                            assert_eq!(state.sxs.len() + 1, ref_state.count_sx);
+
+                            tracing::trace!("Restoring sender state");
+                            state.sxs.push_back(sx);
+                        } else {
+                            tracing::debug!("No sender available");
+                            assert_eq!(state.sxs.len(), 0);
+                            assert_eq!(ref_state.count_sx, 0);
+                        }
+                    }
                     Transition::ResubscribeReceiver => todo!(),
-                    Transition::DropSender => todo!(),
+                    Transition::DropSender => {
+                        tracing::info!("Processing a DROP SEND request");
+
+                        if let Some(sx) = state.sxs.pop_back() {
+                            tracing::debug!("Found a sender to drop");
+                            let count = sx.queue.sender_count();
+                            drop(sx);
+
+                            tracing::trace!(?ref_state, "Comparing to reference state");
+                            assert_eq!(count - 1, ref_state.count_sx);
+                            assert_eq!(state.sxs.len(), ref_state.count_sx);
+                        } else {
+                            tracing::debug!("No sender available");
+                            assert_eq!(state.sxs.len(), 0);
+                            assert_eq!(ref_state.count_sx, 0);
+                        }
+                    }
                     Transition::DropReceiver => todo!(),
                 }
             });
