@@ -1,3 +1,123 @@
+//! `rust-mq` is a asynchronous, lock-free, multiple-producer, multiple-receiver message queue
+//! implementation in unsafe Rust, designed to prevent message loss while maintaining high
+//! performance and minimizing copies.
+//!
+//! This implementation has been thoroughly simulation tested to ensure proper functioning under
+//! many different scenarios and concurrent execution pathways. See the [testing] section for more
+//! information on this.
+//!
+//! # Usage
+//!
+//! You can create a new message queue with [`channel`]. This will allocate a fixed-size ringbuffer
+//! up-front for the queue to use. `rust-mq` differs from other channels though in ways that make
+//! it especially suited to handling application-critical information:
+//!
+//! 1. When [resubscribing], a new [receiver] will still be able to receive messages which were sent
+//!    before it was created, as long as those messages have not already been received.
+//!
+//! 2. A message can only ever be read by a _single_ receiver.
+//!
+//! 3. Messages are not popped from the [`MessageQueue`] until they are [acknowledged].
+//!
+//! 4. It is not enough to [`read`] the value of a message, it has to be acknowledged manually.
+//!
+//! 5. If a message has not been acknowledged by the time it is dropped, it is added back to the
+//!    queue. This avoids situations where a message has been received but some unexpected error
+//!    causes it to be dropped before it can be fully processed (such as a panic). This can also be
+//!    very useful in the context of cancellation safety or when running multiple futures against
+//!    each other.
+//!
+//! The following is a simple example of using `rust-mq` as a bounded spsc channel:
+//!
+//! ```rust
+//! #[tokio::main]
+//! async fn main() {
+//!     let (sx, rx) = rust_mq::channel(100);
+//!
+//!     let handle = tokio::spawn(async move {
+//!         for i in 0..100 {
+//!             // Sends and receives happen concurrently and lock-free!
+//!             sx.send(i);
+//!         }
+//!     });
+//!
+//!     for i in 0..100 {
+//!         // Messages have to be acknowledged explicitly by the receiver, else
+//!         // they are added back to the queue to avoid message loss.
+//!         assert_eq!(rx.recv().await.read_acknowledge(), i);
+//!     };
+//!
+//!     handle.join().await;
+//! }
+//! ```
+//!
+//! # Testing
+//!
+//! To ensure correctness, `rust-mq` is thoroughly tested under many different scenarios. [`loom`]
+//! is used to fuzz hundreds of thousands of concurrent execution pathways and drop calls and
+//! [`proptest`] is used to test the system under hundreds of thousands of different send, recv and
+//! drop transitions. On top of this, known edge cases are tested manually to avoid regressions.
+//!
+//! While this helps ensure a reasonable level of confidence in the system, this is by no means an
+//! exaustive search as some concurrent execution tests had to be bounded in their exploration of
+//! the problem space due to an exponential explosion in complexity. Similarly, proptest performs
+//! a _reasonable_ exploration but does not check every single possible permutation of operations.
+//!
+//! Still, this gives us strong guarantees that `rust-mq` works as intended.
+//!
+//! # Known limitations
+//!
+//! `rust-mq` is still in early development, with some features missing or needing improvements.
+//! This includes:
+//!
+//! ## [closing] a channel
+//!
+//! Currently, calling `close` on a channel will result in all elements sent to the message queue
+//! which have not yet been read to be lost. This can be fixed by having `close` return these
+//! elements, but it is still possible for some  elements to be lost if they were received at the
+//! time of the close but not acknowledged. Adding a `close_wait` which waits for all receivers to
+//! process their messages should fix this.
+//!
+//! ## Re-sending a message
+//!
+//! As the current implementation of [`MessageQueue`] is bounded, this can pause a problem when
+//! trying to re-send a message which has not been acknowledged, as there might be no more space
+//! left. This is made complicated because [`MqGuard`] works by holding an exclusive mutable
+//! reference which points to the value it guards in the message queue. It seems very complicated to
+//! allow the message queue to grow in this special case while keeping these references valid and
+//! avoiding potential DOS vectors. This should still be possible by using a combination of atomic
+//! pointers and some new atomic primitives to replace the references in `MqGuard`, but this will
+//! take quite a bit of effort and significant testing to get right.
+//!
+//! ## Sending a message with no receivers
+//!
+//! It is currently possible to send a message with no receivers. Because of the way in which
+//! [`resubscribe`] works, this means there would be no way to create new receivers and so the
+//! value would be lost. Implementing `close_wait` as mentioned above should alleviate this issue,
+//! but it would also be good for there to be a way to create a new [MqReceiver] from a [MqSender].
+//!
+//! ## Async fuzz testing
+//!
+//! While the concurrent aspect of the system is already quite thoroughly tested, it remains
+//! uncertain whether or not some bugs are possible in cases of strange ordering of async
+//! operations. Async simulation testing in Rust is not as mature however so a custom
+//! implementation of a simulator might be needed.
+//!
+//! # Benchmarks
+//!
+//! Considering the above limitations, I have to assume the API and inner workings of `rust-mq` will
+//! still be changing quite a bit in the near future. I do not see a reason to start benchmarking
+//! this code until its design is a bit more stable.
+//!
+//! [testing]: self#testing
+//! [resubscribing]: MqSender::resubscribe
+//! [sender]: MqSender
+//! [receiver]: MqReceiver
+//! [acknowledged]: MqGuard::acknowledge
+//! [`read`]: MqGuard::read
+//! [closing]: MqSender::close
+//! [`resubscribe`]: MqSender::resubscribe
+
 use crate::macros::*;
 use crate::sync::*;
 
@@ -16,17 +136,29 @@ pub trait TBound: Send + Clone {}
 #[cfg(not(test))]
 impl<T: Send + Clone> TBound for T {}
 
+/// A lock free [`MessageQueue`] sender. Read and writes happen concurrently, with reads having to
+/// be [acknowledged] for a value to be fully removed from the queue.
+///
+/// [acknowledged]: MqGuard::acknowledge
 pub struct MqSender<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
     close: sync::Arc<sync::atomic::AtomicBool>,
     waker: sync::Arc<Waker>,
 }
 
+/// A lock free [`MessageQueue`] receiver. Read and writes happen concurrently, with reads having to
+/// be [acknowledged] for a value to be fully removed from the queue.
+///
+/// [acknowledged]: MqGuard::acknowledge
 pub struct MqReceiver<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
     waker: sync::Arc<Waker>,
 }
 
+/// A guard over a value which has been read from a [`MessageQueue`]. Needs to be [acknowledged]
+/// for the value to be fully removed from the queue.
+///
+/// [acknowledged]: Self::acknowledge
 #[must_use]
 pub struct MqGuard<'a, T: TBound> {
     ack: bool,
@@ -35,7 +167,85 @@ pub struct MqGuard<'a, T: TBound> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
-struct MessageQueue<T: TBound> {
+/// A lock-free atomic message queue.
+///
+/// # Implementation details
+///
+/// This queue is backed by a ring buffer which is bounded into three atomic regions:
+///
+/// - The write region represents a contiguous part of the ring which is reserved for future writes:
+///   initially, this is the whole of the queue.
+///
+/// - The read region represents a contiguous part of the queue which is reserved for reads:
+///   initially this is empty but fills from the write region as new values are written.
+///
+/// - The acknowledge region represents a contiguous part of the queue where values have been read
+///   but not yet acknowledged. Such values can no longer be read but cannot be overwritten yet.
+///
+/// ## Inner ring
+///
+/// The ring buffer backing this message queue might look something like this:
+///
+/// ```rust
+/// //
+/// //    ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐
+/// // B: │ a │ a │!a │ r │ r │ w │ w │ w │ w │
+/// //    └───┴───┴───┴───┴───┴───┴───┴───┴───┘
+/// //      0   1   2   3   4   5   6   7   8
+/// //
+/// //    ┌───────────────────────────────────┐
+/// //    │ .B: buffer                        │
+/// //    │ .r: read region                   │
+/// //    │ .w: write region                  │
+/// //    │ .a: acknowledged                  │
+/// //    │ !a: NOT acknowledged              │
+/// //    └───────────────────────────────────┘
+/// ```
+///
+/// The write region will grow as needed during attempted writes. In the above example, the first
+/// two cells of the ring buffer can be overwritten as they have been read and acknowledged, but
+/// the third one is not! Any cell after that cannot be overwritten as it is either part of the
+/// current read or write regions.
+///
+/// ## Atomicity
+///
+/// Because of the way the underlying ring buffer is structured, each region has to be updated
+/// atomically as a whole. This means that it should not be possible for a thread to see an update
+/// to the read region that does not coincide with an update to the write region for example (as
+/// this would mean that we are indexing into potentially uninitialized memory -yikes!). To avoid
+/// this, information about the read and write regions are encoded as [`u16`] values inside a single
+/// [`AtomicU64`] as follows:
+///
+/// ```rust
+/// // 0x aaaa bbbb cccc dddd
+/// //    └┬─┘ └┬─┘ └┬─┘ └┬─┘
+/// //     │    │    │    │
+/// //     │    │    │   read size
+/// //     │    │    │
+/// //     │    │   read index
+/// //     │    │
+/// //     │   write size
+/// //     │
+/// //    write index
+/// ```
+///
+/// The acknowledge region is a bit more tricky as it can get fragmented since elements can be
+/// acknowledged individually and irrespective of the order in which they are received. This sort
+/// of information is stored as an [`AtomicBool`] inside of each cell. At any point, the ring
+/// buffer might then look something like this:
+///
+/// ```rust
+/// //    ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐
+/// // B: │!a │ a │!a │ r │ r │ w │ w │ w │ w │
+/// //    └───┴───┴───┴───┴───┴───┴───┴───┴───┘
+/// ```
+///
+/// Where several non-consecutive cells are have not yet been marked as acknowledged. This is
+/// checked when we try and grow the write region to see if a cell is safe to overwrite.
+///
+/// [`AtomicU64`]: std::sync::atomic::AtomicU64
+/// [`AtomicBool`]: std::sync::atomic::AtomicBool
+pub struct MessageQueue<T: TBound> {
     ring: std::ptr::NonNull<AckCell<T>>,
     senders: sync::atomic::AtomicUsize,
     read_write: sync::atomic::AtomicU64,
@@ -108,6 +318,11 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
         // handled by `acknowledge` if it is called (which also sets the `ack` flag so we don't
         // double free here).
         if !self.ack {
+            // It is safe not to clone here since:
+            //
+            // 1. Simply reading the element returns a clone to the user,
+            // 2. Read-acknowledging the element does not create a clone but then this would not
+            //    execute.
             let elem = self.elem_take();
             self.cell.ack.store(true, sync::atomic::Ordering::Release);
 
@@ -141,6 +356,8 @@ impl<T: TBound> Drop for MessageQueue<T> {
     }
 }
 
+/// Initializes a new [`MqSender`] and [`MqReceiver`] which both index over the same bounded
+/// [`MessageQueue`]. No more than `cap` messages can be held at once in the queue.
 #[cfg_attr(test, tracing::instrument)]
 pub fn channel<T: TBound>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
     debug!("Creating new channel");
@@ -163,7 +380,8 @@ impl<T: TBound> MqSender<T> {
         Self { queue, close: sync::Arc::new(sync::atomic::AtomicBool::new(false)), waker: wake }
     }
 
-    fn resubscribe(&self) -> Self {
+    /// Creates a new instance of [`MqSender`] which indexes over the same [`MessageQueue`].
+    pub fn resubscribe(&self) -> Self {
         self.queue.sender_register();
         Self {
             queue: sync::Arc::clone(&self.queue),
@@ -172,6 +390,7 @@ impl<T: TBound> MqSender<T> {
         }
     }
 
+    /// Sends a value to the underlying [`MessageQueue`] to be received by all its [`MqReceiver`]s
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub fn send(&self, elem: T) -> Option<T> {
         debug!("Trying to send value");
@@ -190,6 +409,9 @@ impl<T: TBound> MqSender<T> {
         }
     }
 
+    // TODO: make is to this returns all the messages which have not been read yet!
+    /// Closes the [`MessageQueue`], waking up any [`MqReceiver`] in the process.
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub fn close(self) {
         warn!("Closing channel");
 
@@ -219,11 +441,16 @@ impl<T: TBound> MqReceiver<T> {
         Self { queue, waker: wake }
     }
 
-    fn resubscribe(&self) -> Self {
+    /// Creates a new instance of [`MqReceiver`] which indexes over the same [`MessageQueue`].
+    pub fn resubscribe(&self) -> Self {
         self.waker.resubscribe();
         Self { queue: sync::Arc::clone(&self.queue), waker: sync::Arc::clone(&self.waker) }
     }
 
+    /// Receives the next value sent to the underlying [`MessageQueue`] or waits for one to be
+    /// available. Values have to be [acknowledged] or else they will be sent back into the queue.
+    ///
+    /// [acknowledged]: MqGuard::acknowledge
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub async fn recv(&self) -> Option<MqGuard<T>> {
         debug!("Trying to receive value");
@@ -255,10 +482,17 @@ impl<'a, T: TBound> MqGuard<'a, T> {
         MqGuard { ack: false, queue, cell, _phantom: std::marker::PhantomData }
     }
 
+    /// Creates a [`Clone`] of the guarded value but does not [acknowledge] it.
+    ///
+    /// [acknowledge]: Self::acknowledge
     pub fn read(&self) -> T {
         unsafe { self.cell.elem.assume_init_ref().clone() }
     }
 
+    /// Retrieves the guarded value and [acknowledges] it. This method does not result in a
+    /// [`Clone`].
+    ///
+    /// [acknowledges]: Self::acknowledge
     #[tracing::instrument(skip(self))]
     pub fn read_acknowledge(mut self) -> T {
         let elem = self.elem_take();
@@ -267,12 +501,13 @@ impl<'a, T: TBound> MqGuard<'a, T> {
         elem
     }
 
+    /// Acknowledges a value. Values which are not explicitly acknowledged will be sent back to
+    /// their [`MessageQueue`] to be processed again.
     pub fn acknowledge(mut self) {
         self.ack = true;
         self.cell.ack.store(true, sync::atomic::Ordering::Release);
     }
 
-    // Invariant: calling this twice will result in a double free
     fn elem_take(&mut self) -> T {
         let mut elem = std::mem::MaybeUninit::uninit();
         std::mem::swap(&mut self.cell.elem, &mut elem);
@@ -715,10 +950,7 @@ mod test {
 /// To run the tests below, first enter:
 ///
 /// ```bash
-/// LOOM_LOCATION=1 \
-///     LOOM_CHECKPOINT_INTERVAL=1 \
-///     LOOM_CHECKPOINT_FILE=test_name.json \
-///     cargo test test_name --release --features loom
+/// cargo test test_name --release --features loom
 /// ```
 ///
 /// This will begin by running loom with no logs, checking all possible permutations of
@@ -734,11 +966,7 @@ mod test {
 /// Once a failing case has been identified, resume the tests with:
 ///
 /// ```bash
-/// LOOM_LOG=debug \
-///     LOOM_LOCATION=1 \
-///     LOOM_CHECKPOINT_INTERVAL=1 \
-///     LOOM_CHECKPOINT_FILE=test_name.json \
-///     cargo test test_name --release --features loom
+/// RUST_LOG=debug cargo test test_name --release --features loom
 /// ```
 ///
 /// This will resume testing with the previously failing case. We enable logging this time as only a
@@ -746,21 +974,13 @@ mod test {
 ///
 /// > Note that if ever you update the code of a test, you will then need to delete
 /// > `LOOM_CHECKPOINT_FILE` before running the tests again. Otherwise loom will complain about
-// > having reached an unexpected execution path.
+/// > having reached an unexpected execution path.
 ///
 /// # Complexity explosion
 ///
 /// Due to the way in which loom checks for concurrent access permutations, execution time will grow
-/// exponentially with the size of the model. For this reason, it might be necessary to limit the
-/// breath of checks done by loom.
-///
-/// ```bash
-/// LOOM_MAX_PREEMPTIONS=3 \
-///     LOOM_LOCATION=1 \
-///     LOOM_CHECKPOINT_INTERVAL=1 \
-///     LOOM_CHECKPOINT_FILE=test_name.json \
-///     cargo test test_name --release --features loom
-/// ```
+/// exponentially with the size of the model. For this reason, some particularly demanding tests
+/// are configured to prune branches which are less likely to reveal bugs.
 ///
 /// From the loom docs:
 ///
@@ -1320,6 +1540,18 @@ mod threadtesting {
     // TEST: proptest
 }
 
+/// [proptest] is a hypothesis-like framework which allows us to test the invariants of a System
+/// Under Test (or SUT) by having it run against many different simulated scenarios. We model this
+/// here using [proptest_state_machine] to test our SUT under a series of legal transitions.
+///
+/// If during the run, any invariant is violated, then proptest will automatically try and regress
+/// this issue to a minimum failing case by shrinking the inputs (the transitions) which lead to
+/// the failed invariants. This has the advantage that generally, a problem which might have
+/// occurred as the result of 100 transitions would be narrowed down to 4 transitions (for example).
+///
+/// At the same time, we can test for many, many more scenarios that we could ever write by hand
+/// (the test below for example will simulate an average 262,144 different transitions and ensure
+/// they are all valid).
 #[cfg(all(test, feature = "proptest"))]
 mod proptesting {
     use super::*;
@@ -1333,7 +1565,7 @@ mod proptesting {
             // transitions for each case.
             verbose: 1,
             // The number of tests which need to be valid for this to pass.
-            cases: 256,
+            cases: 1024,
             // Max duration (in milliseconds) for each generated case.
             timeout: 1_000,
             ..Default::default()
