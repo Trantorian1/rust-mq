@@ -1487,15 +1487,19 @@ mod proptesting {
         type Transition = Transition;
 
         fn init_state() -> BoxedStrategy<Self::State> {
-            (1..512u16).prop_map(|cap| Self::new(cap)).boxed()
+            (1..512u16).prop_map(Self::new).boxed()
         }
 
         fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
             prop_oneof![
-                2 => Just(Transition::Send(state.next)),
-                2 => Just(Transition::Recv),
+                // 75% of the time we are either sending or receiving
+                6 => Just(Transition::Send(state.next)),
+                6 => Just(Transition::Recv),
+                // 25% of the time we are resubscribing or dropping
                 1 => Just(Transition::ResubscribeSender),
+                1 => Just(Transition::ResubscribeReceiver),
                 1 => Just(Transition::DropSender),
+                1 => Just(Transition::DropReceiver),
             ]
             .boxed()
         }
@@ -1567,12 +1571,8 @@ mod proptesting {
             ref_state: &<Self::Reference as ReferenceStateMachine>::State,
             transition: <Self::Reference as ReferenceStateMachine>::Transition,
         ) -> Self::SystemUnderTest {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .create(true)
-                .open("./log")
-                .expect("Failed to open file");
+            let file =
+                std::fs::OpenOptions::new().append(true).create(true).open("./log").expect("Failed to open file");
             let (appender, _guard) = tracing_appender::non_blocking(file);
             let logger = log_conf().with_writer(appender).finish();
 
@@ -1660,6 +1660,8 @@ mod proptesting {
                             state.rxs.push_front(rx);
                         } else {
                             tracing::debug!("No receiver available");
+                            assert_eq!(state.rxs.len(), 0);
+                            assert_eq!(ref_state.count_rx, 0);
                         }
                     }
                     Transition::ResubscribeSender => {
@@ -1682,7 +1684,25 @@ mod proptesting {
                             assert_eq!(ref_state.count_sx, 0);
                         }
                     }
-                    Transition::ResubscribeReceiver => todo!(),
+                    Transition::ResubscribeReceiver => {
+                        tracing::info!("Processing a RESUB RECV request");
+
+                        if let Some(rx) = state.rxs.pop_back() {
+                            tracing::debug!("Found a receiver for resub");
+
+                            state.rxs.push_front(rx.resubscribe());
+
+                            tracing::trace!(?ref_state, "Comparing to reference state");
+                            assert_eq!(state.rxs.len() + 1, ref_state.count_rx);
+
+                            tracing::trace!("Restoring receiver state");
+                            state.rxs.push_back(rx);
+                        } else {
+                            tracing::debug!("No receiver available");
+                            assert_eq!(state.rxs.len(), 0);
+                            assert_eq!(ref_state.count_rx, 0);
+                        }
+                    }
                     Transition::DropSender => {
                         tracing::info!("Processing a DROP SEND request");
 
@@ -1700,7 +1720,21 @@ mod proptesting {
                             assert_eq!(ref_state.count_sx, 0);
                         }
                     }
-                    Transition::DropReceiver => todo!(),
+                    Transition::DropReceiver => {
+                        tracing::info!("Processing a DROP RECV request");
+
+                        if let Some(rx) = state.rxs.pop_back() {
+                            tracing::debug!("Found a receiver to drop");
+                            drop(rx);
+
+                            tracing::trace!(?ref_state, "Comparing to reference state");
+                            assert_eq!(state.rxs.len(), ref_state.count_rx);
+                        } else {
+                            tracing::debug!("No receiver available");
+                            assert_eq!(state.rxs.len(), 0);
+                            assert_eq!(ref_state.count_rx, 0);
+                        }
+                    }
                 }
             });
             state
