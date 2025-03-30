@@ -1,16 +1,5 @@
-#[cfg(feature = "loom")]
-use loom::alloc;
-#[cfg(feature = "loom")]
-use loom::sync;
-#[cfg(feature = "loom")]
-use loom::sync::Notify;
-
-#[cfg(not(feature = "loom"))]
-use std::alloc;
-#[cfg(not(feature = "loom"))]
-use std::sync;
-#[cfg(not(feature = "loom"))]
-use tokio::sync::Notify;
+use crate::macros::*;
+use crate::sync::*;
 
 const WRIT_INDX_MASK: u64 = 0xffff000000000000;
 const WRIT_SIZE_MASK: u64 = 0x0000ffff00000000;
@@ -22,27 +11,6 @@ pub trait TBound: Send + Clone + std::fmt::Debug {}
 #[cfg(test)]
 impl<T: Send + Clone + std::fmt::Debug> TBound for T {}
 
-macro_rules! debug {
-    ($($arg:tt)+) => {
-        #[cfg(test)]
-        tracing::debug!($($arg)+)
-    };
-}
-
-macro_rules! warn {
-    ($($arg:tt)+) => {
-        #[cfg(test)]
-        tracing::warn!($($arg)+)
-    };
-}
-
-macro_rules! error {
-    ($($arg:tt)+) => {
-        #[cfg(test)]
-        tracing::error!($($arg)+)
-    };
-}
-
 #[cfg(not(test))]
 pub trait TBound: Send + Clone {}
 #[cfg(not(test))]
@@ -51,18 +19,12 @@ impl<T: Send + Clone> TBound for T {}
 pub struct MqSender<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
     close: sync::Arc<sync::atomic::AtomicBool>,
-    #[cfg(feature = "loom")]
-    wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
-    #[cfg(not(feature = "loom"))]
-    wake: sync::Arc<Notify>,
+    waker: sync::Arc<Waker>,
 }
 
 pub struct MqReceiver<T: TBound> {
     queue: sync::Arc<MessageQueue<T>>,
-    #[cfg(feature = "loom")]
-    wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
-    #[cfg(not(feature = "loom"))]
-    wake: sync::Arc<Notify>,
+    waker: sync::Arc<Waker>,
 }
 
 #[must_use]
@@ -133,16 +95,7 @@ impl<T: TBound> Drop for MqSender<T> {
     fn drop(&mut self) {
         if !self.close.load(sync::atomic::Ordering::Acquire) {
             self.queue.sender_unregister();
-
-            #[cfg(feature = "loom")]
-            {
-                let lock = self.wake.lock().unwrap();
-                for notify in lock.iter() {
-                    notify.notify();
-                }
-            }
-            #[cfg(not(feature = "loom"))]
-            self.wake.notify_waiters();
+            self.waker.notify_waiters();
         }
     }
 }
@@ -195,12 +148,7 @@ pub fn channel<T: TBound>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
     let queue_s = sync::Arc::new(MessageQueue::new(cap));
     let queue_r = sync::Arc::clone(&queue_s);
 
-    #[cfg(feature = "loom")]
-    let wake_s = sync::Arc::new(sync::Mutex::new(std::collections::VecDeque::from_iter(
-        [sync::Arc::new(Notify::new())].into_iter(),
-    )));
-    #[cfg(not(feature = "loom"))]
-    let wake_s = sync::Arc::new(Notify::new());
+    let wake_s = sync::Arc::new(Waker::new());
     let wake_r = sync::Arc::clone(&wake_s);
 
     let sx = MqSender::new(queue_s, wake_s);
@@ -210,13 +158,9 @@ pub fn channel<T: TBound>(cap: u16) -> (MqSender<T>, MqReceiver<T>) {
 }
 
 impl<T: TBound> MqSender<T> {
-    fn new(
-        queue: sync::Arc<MessageQueue<T>>,
-        #[cfg(feature = "loom")] wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
-        #[cfg(not(feature = "loom"))] wake: sync::Arc<Notify>,
-    ) -> Self {
+    fn new(queue: sync::Arc<MessageQueue<T>>, wake: sync::Arc<Waker>) -> Self {
         queue.sender_register();
-        Self { queue, close: sync::Arc::new(sync::atomic::AtomicBool::new(false)), wake }
+        Self { queue, close: sync::Arc::new(sync::atomic::AtomicBool::new(false)), waker: wake }
     }
 
     fn resubscribe(&self) -> Self {
@@ -224,7 +168,7 @@ impl<T: TBound> MqSender<T> {
         Self {
             queue: sync::Arc::clone(&self.queue),
             close: sync::Arc::clone(&self.close),
-            wake: sync::Arc::clone(&self.wake),
+            waker: sync::Arc::clone(&self.waker),
         }
     }
 
@@ -240,17 +184,7 @@ impl<T: TBound> MqSender<T> {
             }
             None => {
                 debug!("Value sent successfully");
-
-                #[cfg(feature = "loom")]
-                {
-                    let lock = self.wake.lock().unwrap();
-                    for notify in lock.iter() {
-                        notify.notify();
-                    }
-                }
-                #[cfg(not(feature = "loom"))]
-                self.wake.notify_one();
-
+                self.waker.notify_one();
                 None
             }
         }
@@ -275,33 +209,19 @@ impl<T: TBound> MqSender<T> {
                 unsafe { self.queue.ring.add(i as usize).read().elem.assume_init() };
             }
 
-            #[cfg(feature = "loom")]
-            {
-                let lock = self.wake.lock().unwrap();
-                for notify in lock.iter() {
-                    notify.notify();
-                }
-            }
-            #[cfg(not(feature = "loom"))]
-            self.wake.notify_waiters();
+            self.waker.notify_waiters();
         }
     }
 }
 
 impl<T: TBound> MqReceiver<T> {
-    fn new(
-        queue: sync::Arc<MessageQueue<T>>,
-        #[cfg(feature = "loom")] wake: sync::Arc<sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>>,
-        #[cfg(not(feature = "loom"))] wake: sync::Arc<Notify>,
-    ) -> Self {
-        Self { queue, wake }
+    fn new(queue: sync::Arc<MessageQueue<T>>, wake: sync::Arc<Waker>) -> Self {
+        Self { queue, waker: wake }
     }
 
     fn resubscribe(&self) -> Self {
-        #[cfg(feature = "loom")]
-        self.wake.lock().unwrap().push_back(sync::Arc::new(Notify::new()));
-
-        Self { queue: sync::Arc::clone(&self.queue), wake: sync::Arc::clone(&self.wake) }
+        self.waker.resubscribe();
+        Self { queue: sync::Arc::clone(&self.queue), waker: sync::Arc::clone(&self.waker) }
     }
 
     #[cfg_attr(test, tracing::instrument(skip(self)))]
@@ -321,23 +241,7 @@ impl<T: TBound> MqReceiver<T> {
                         break None;
                     } else {
                         debug!("Waiting for a send");
-
-                        #[cfg(feature = "loom")]
-                        {
-                            let mut lock = self.wake.lock().unwrap();
-                            let len = lock.len();
-                            let notify = lock.pop_front().unwrap();
-
-                            debug!(len, "Retrieved notifier");
-
-                            lock.push_back(sync::Arc::clone(&notify));
-                            drop(lock);
-
-                            notify.wait();
-                        }
-                        #[cfg(not(feature = "loom"))]
-                        self.wake.notified().await;
-
+                        self.waker.notified().await;
                         debug!("A send was detected");
                     }
                 }
@@ -775,7 +679,7 @@ mod common {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod test {
     use super::*;
     use common::*;
