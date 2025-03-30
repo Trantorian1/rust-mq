@@ -1,4 +1,4 @@
-# `rust-mq`
+# 🦀 `rust-mq`
 
 `rust-mq` is a **asynchronous**, **lock-free**, multiple-producer, multiple-receiver message queue 
 implementation in unsafe Rust, designed to prevent message loss while maintaining high
@@ -11,7 +11,7 @@ cargo doc --no-deps --all-features && \
     open target/doc/rust_mq/index.html
 ```
 
-## Usage
+## ⚙️ Usage
 
 You can create a new message queue with `channel`. This will allocate a fixed-size ring buffer
 up-front for the queue to use. `rust-mq` differs from other channels though in ways that make
@@ -56,7 +56,7 @@ async fn main() {
 }
 ```
 
-## Testing
+## 📝 Testing
  
 To ensure correctness, `rust-mq` is thoroughly tested under many different scenarios. [`loom`]
 is used to fuzz hundreds of thousands of concurrent execution pathways and drop calls and
