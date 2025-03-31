@@ -4,7 +4,7 @@
 implementation in unsafe Rust, designed to prevent message loss while maintaining high
 performance and minimizing copies.
 
-You can read more about the implementation details and how it works by by reading the docs:
+You can read more about the implementation details and how it works by reading the docs:
 
 ```bash
 cargo doc --no-deps --all-features && \
@@ -17,7 +17,7 @@ You can create a new message queue with `channel`. This will allocate a fixed-si
 up-front for the queue to use. `rust-mq` differs from other channels though in ways that make
 it especially suited to handling application-critical information:
 
-1. When [resubscribing], a new [receiver] will still be able to receive messages which were sent
+1. When resubscribing, a new receiver will still be able to receive messages which were sent
    before it was created, as long as those messages have not already been received.
 
 2. A message can only ever be read by a _single_ receiver.
@@ -72,3 +72,4 @@ Still, this gives us strong guarantees that `rust-mq` works as intended.
 
 [`loom`]: https://github.com/tokio-rs/loom 
 [`proptest`]: https://github.com/proptest-rs/proptest
+
