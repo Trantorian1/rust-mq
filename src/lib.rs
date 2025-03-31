@@ -8,7 +8,7 @@
 //!
 //! # Usage
 //!
-//! You can create a new message queue with [`channel`]. This will allocate a fixed-size ringbuffer
+//! You can create a new message queue with [`channel`]. This will allocate a fixed-size ring buffer
 //! up-front for the queue to use. `rust-mq` differs from other channels though in ways that make
 //! it especially suited to handling application-critical information:
 //!
@@ -34,7 +34,7 @@
 //! async fn main() {
 //!     let (sx, rx) = rust_mq::channel(100);
 //!
-//!     let handle = tokio::spawn(async move {
+//!     tokio::spawn(async move {
 //!         for i in 0..100 {
 //!             // Sends and receives happen concurrently and lock-free!
 //!             sx.send(i);
@@ -44,10 +44,8 @@
 //!     for i in 0..100 {
 //!         // Messages have to be acknowledged explicitly by the receiver, else
 //!         // they are added back to the queue to avoid message loss.
-//!         assert_eq!(rx.recv().await.read_acknowledge(), i);
+//!         assert_eq!(rx.recv().await.unwrap().read_acknowledge(), i);
 //!     };
-//!
-//!     handle.join().await;
 //! }
 //! ```
 //!

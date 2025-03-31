@@ -723,7 +723,10 @@ fn get_raw_bytes(writ_indx: u16, writ_size: u16, read_indx: u16, read_size: u16)
 }
 
 #[cfg(test)]
-mod common {
+pub mod common {
+    use super::*;
+    use crate::macros::test::*;
+
     pub(crate) type LogConfig = tracing_subscriber::fmt::SubscriberBuilder<
         tracing_subscriber::fmt::format::DefaultFields,
         tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, ()>,
@@ -792,10 +795,513 @@ mod common {
             self.elem.clone()
         }
     }
+
+    pub(crate) async fn spsc_1() {
+        let (sx, rx) = channel(1);
+        let elem = 42;
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx.queue.writ_indx(), 0);
+        assert_eq!(sx.queue.writ_size(), 1); // closest power of 2
+        assert_eq!(sx.queue.read_indx(), 0);
+        assert_eq!(sx.queue.read_size(), 0);
+
+        let handle = spawn! {
+            tracing::info!(elem, "Sending element");
+            assert_matches::assert_matches!(
+                sx.send(DropCounter::new(vec![elem], counter1)),
+                None,
+                "Failed to send value, message queue is {:#?}",
+                sx.queue
+            );
+        };
+
+        block_on! {
+            tracing::info!(elem, "Waiting for element");
+            let guard = rx.recv().await;
+            assert_matches::assert_matches!(
+                guard,
+                Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![elem]) },
+                "Failed to acquire acknowledge guard, message queue is {:#?}",
+                rx.queue
+            );
+
+            tracing::info!("Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 1)
+        };
+
+        join!(handle);
+    }
+
+    pub(crate) async fn spsc_2() {
+        let (sx, rx) = channel(3);
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx.queue.writ_indx(), 0);
+        assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
+        assert_eq!(sx.queue.read_indx(), 0);
+        assert_eq!(sx.queue.read_size(), 0);
+
+        let handle = spawn! {
+            for i in 0..2 {
+                tracing::info!(i, "Sending element");
+                assert_matches::assert_matches!(
+                    sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                    None,
+                    "Failed to send {i}, message queue is {:#?}",
+                    sx.queue
+                )
+            }
+        };
+
+        block_on! {
+            for i in 0..2 {
+                tracing::info!(i, "Waiting for element");
+                let guard = rx.recv().await;
+                tracing::info!(i, "Received element");
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]) },
+                    "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                    rx.queue
+                );
+            }
+
+            tracing::info!("Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2)
+        };
+
+        join!(handle);
+    }
+
+    pub(crate) async fn spmc() {
+        let (sx, rx1) = channel(3);
+        let rx2 = rx1.resubscribe();
+        let rx3 = rx1.resubscribe();
+
+        let witness1 = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::default()));
+        let witness2 = std::sync::Arc::clone(&witness1);
+        let witness3 = std::sync::Arc::clone(&witness1);
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx.queue.writ_indx(), 0);
+        assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
+        assert_eq!(sx.queue.read_indx(), 0);
+        assert_eq!(sx.queue.read_size(), 0);
+
+        let handle1 = spawn! {
+            for i in 0..2 {
+                assert_matches::assert_matches!(
+                    sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                    None,
+                    "Failed to send {i}, message queue is {:#?}",
+                    sx.queue
+                )
+            }
+        };
+
+        let handle2 = spawn! {
+            block_on! {
+                tracing::info!("Waiting for element");
+                let guard = rx1.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { witness1.lock().await.push(guard.read_acknowledge().get()) },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx1.queue
+                );
+            }
+        };
+
+        let handle3 = spawn! {
+            block_on! {
+                tracing::info!("Waiting for element");
+                let guard = rx2.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { witness2.lock().await.push(guard.read_acknowledge().get()) },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx2.queue
+                );
+            }
+        };
+
+        join!(handle1);
+        join!(handle2);
+        join!(handle3);
+
+        block_on! {
+            tracing::info!(?rx3, "Checking close correctness");
+            let guard = rx3.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            let mut witness = witness3.lock().await;
+            witness.sort();
+            tracing::info!(witness = ?*witness, "Checking receive correctness");
+
+            for (expected, actual) in witness.iter().enumerate() {
+                assert_eq!(*actual, vec![expected]);
+            }
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2);
+        };
+    }
+
+    pub(crate) async fn mpsc() {
+        let (sx1, rx) = channel(3);
+        let sx2 = sx1.resubscribe();
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+        let counter3 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx1.queue.writ_indx(), 0);
+        assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
+        assert_eq!(sx1.queue.read_indx(), 0);
+        assert_eq!(sx1.queue.read_size(), 0);
+
+        let handle1 = spawn! {
+            assert_matches::assert_matches!(
+                sx1.send(DropCounter::new(vec![42], counter1)),
+                None,
+                "Failed to send 42, message queue is {:#?}",
+                sx1.queue
+            )
+        };
+
+        let handle2 = spawn! {
+            assert_matches::assert_matches!(
+                sx2.send(DropCounter::new(vec![69], counter2)),
+                None,
+                "Failed to send 69, message queue is {:#?}",
+                sx2.queue
+            )
+        };
+
+        block_on! {
+            let mut res = vec![];
+
+            for i in 0..2 {
+                tracing::info!("Waiting for element");
+                let guard = rx.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { res.push(guard.read_acknowledge().get()) },
+                    "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                    rx.queue
+                );
+            }
+
+            tracing::info!("Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            res.sort();
+            tracing::info!(?res, "Checking receive correctness");
+
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0], vec![42]);
+            assert_eq!(res[1], vec![69]);
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 2);
+        };
+
+        join!(handle1);
+        join!(handle2);
+    }
+
+    pub(crate) async fn resend() {
+        let (sx1, rx) = channel(2);
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx1.queue.writ_indx(), 0);
+        assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+        assert_eq!(sx1.queue.read_indx(), 0);
+        assert_eq!(sx1.queue.read_size(), 0);
+
+        let handle = spawn! {
+            // Notice that we only send ONE element!
+            tracing::info!("Sending element");
+            assert_matches::assert_matches!(
+                sx1.send(DropCounter::new(vec![69], counter1)),
+                None,
+                "Failed to send 69, message queue is {:#?}",
+                sx1.queue
+            )
+        };
+
+        block_on! {
+            // We receive the element once but we do not acknowledge it, so it is added back to
+            // the queue.
+            tracing::info!("Waiting for element");
+            let guard = rx.recv().await;
+            assert_matches::assert_matches!(
+                guard,
+                Some(guard) => { assert_eq!(guard.read().get(), vec![69]); },
+                "Failed to acquire acknowledge guard, message queue is {:#?}",
+                rx.queue
+            );
+
+            // We receive the element a second time and we acknowledge it...
+            tracing::info!("Waiting for element");
+            let guard = rx.recv().await;
+            assert_matches::assert_matches!(
+                guard,
+                Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![69]); },
+                "Failed to acquire acknowledge guard, message queue is {:#?}",
+                rx.queue
+            );
+
+            // ...so that the queue is now empty.
+            tracing::info!("Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            // We count 2 drops because calling `MqGuard.read()` creates a clone of the
+            // underlying data (`MqGuard.read_acknowledge` does not).
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2);
+        };
+
+        join!(handle);
+    }
+
+    pub(crate) async fn wrap_around() {
+        let (sx1, rx1) = channel(2);
+        let sx2 = sx1.resubscribe();
+        let rx2 = rx1.resubscribe();
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+        let counter3 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx1.queue.writ_indx(), 0);
+        assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+        assert_eq!(sx1.queue.read_indx(), 0);
+        assert_eq!(sx1.queue.read_size(), 0);
+
+        let handle = spawn! {
+            for i in 0..2 {
+                tracing::info!(i, "Sending element");
+                assert_matches::assert_matches!(
+                    sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                    None,
+                    "Failed to send {i}, message queue is {:#?}",
+                    sx1.queue
+                )
+            }
+        };
+
+        block_on! {
+            for i in 0..2 {
+                tracing::info!("Waiting for element");
+                let guard = rx1.recv().await;
+                tracing::info!("Received element");
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
+                    "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                    rx1.queue
+                );
+            }
+        };
+        join!(handle);
+
+        let handle = spawn! {
+            for i in 2..4 {
+                tracing::info!(i, "Sending element");
+                assert_matches::assert_matches!(
+                    sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))),
+                    None,
+                    "Failed to send {i}, message queue is {:#?}",
+                    sx2.queue
+                )
+            }
+        };
+
+        block_on! {
+            for i in 2..4 {
+                tracing::info!("Waiting for element");
+                let guard = rx2.recv().await;
+                tracing::info!("Received element");
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
+                    "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
+                    rx2.queue
+                );
+            }
+
+            tracing::info!(?rx2, "Checking close correctness");
+            let guard = rx2.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 4)
+        };
+        join!(handle);
+    }
+
+    pub(crate) async fn close() {
+        let (sx1, rx) = channel(3);
+        let sx2 = sx1.resubscribe();
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+        let counter3 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx1.queue.writ_indx(), 0);
+        assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
+        assert_eq!(sx1.queue.read_indx(), 0);
+        assert_eq!(sx1.queue.read_size(), 0);
+
+        let handle1 = spawn! {
+            for i in 0..2 {
+                tracing::info!(i, "Sending element");
+                sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1)));
+            }
+            sx1.close();
+        };
+
+        let handle2 = spawn! {
+            for i in 2..4 {
+                tracing::info!(i, "Sending element");
+                sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2)));
+            }
+            sx2.close();
+        };
+
+        join!(handle1);
+        join!(handle2);
+
+        block_on! {
+            tracing::info!(?rx, "Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 4)
+        };
+    }
+
+    pub(crate) async fn zst() {
+        let (sx, rx) = channel(3);
+
+        assert_eq!(sx.queue.writ_indx(), 0);
+        assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
+        assert_eq!(sx.queue.read_indx(), 0);
+        assert_eq!(sx.queue.read_size(), 0);
+
+        let handle = spawn! {
+            for _ in 0..2 {
+                tracing::info!("Sending element");
+                assert_matches::assert_matches!(sx.send(()), None, "Failed to send, message queue is {:#?}", sx.queue)
+            }
+        };
+
+        block_on! {
+            for _ in 0..2 {
+                tracing::info!("Waiting for element");
+                let guard = rx.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { guard.acknowledge() },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx.queue
+                );
+            }
+
+            tracing::info!(?rx, "Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+        };
+
+        join!(handle);
+    }
+
+    pub(crate) async fn fail_send() {
+        let (sx1, rx) = channel(2);
+        let sx2 = sx1.resubscribe();
+
+        let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = std::sync::Arc::clone(&counter1);
+        let counter3 = std::sync::Arc::clone(&counter1);
+
+        assert_eq!(sx1.queue.writ_indx(), 0);
+        assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
+        assert_eq!(sx1.queue.read_indx(), 0);
+        assert_eq!(sx1.queue.read_size(), 0);
+
+        let handle = spawn! {
+            for i in 0..2 {
+                tracing::info!(i, "Sending element");
+                assert_matches::assert_matches!(
+                    sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                    None,
+                    "Failed to send {i}, message queue is {:#?}",
+                    sx1.queue
+                )
+            }
+        };
+        join!(handle);
+
+        let handle = spawn! {
+            tracing::info!("Sending element");
+            assert_matches::assert_matches!(
+                sx2.send(DropCounter::new(vec![2], counter2)),
+                Some(counter) => { assert_eq!(counter.get(), vec![2]) },
+                "Queue should be full! {:#?}",
+                sx2.queue
+            )
+        };
+        join!(handle);
+
+        block_on! {
+            for i in 0..2 {
+                tracing::info!(i, "Waiting for element");
+                let guard = rx.recv().await;
+                assert_matches::assert_matches!(
+                    guard,
+                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
+                    "Failed to acquire acknowledge guard, message queue is {:#?}",
+                    rx.queue
+                );
+            }
+
+            tracing::info!(?rx, "Checking close correctness");
+            let guard = rx.recv().await;
+            assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+            // We drop the sent value 3 times:
+            // - in the first two (successful) sends
+            // - in the last (failed) send
+            tracing::info!("Checking drop correctness");
+            assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 3)
+        };
+    }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
-mod test {
+// #[cfg(all(test, not(feature = "loom")))]
+#[cfg(test)]
+pub(crate) mod test {
     use super::*;
     use common::*;
 
@@ -815,6 +1321,60 @@ mod test {
         assert_eq!(sx.send(0), None);
         assert_eq!(rx.recv().await.unwrap().read_acknowledge(), 0);
         assert_eq!(sx.send(1), None);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    pub(crate) async fn spsc_1(#[allow(unused)] log_stdout: ()) {
+        common::spsc_1().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn spsc_2(#[allow(unused)] log_stdout: ()) {
+        common::spsc_2().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn spmc(#[allow(unused)] log_stdout: ()) {
+        common::spmc().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn mpsc(#[allow(unused)] log_stdout: ()) {
+        common::mpsc().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn resend(#[allow(unused)] log_stdout: ()) {
+        common::resend().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn wrap_around(#[allow(unused)] log_stdout: ()) {
+        common::wrap_around().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn close(#[allow(unused)] log_stdout: ()) {
+        common::close().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn zst(#[allow(unused)] log_stdout: ()) {
+        common::zst().await;
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn fail_send(#[allow(unused)] log_stdout: ()) {
+        common::fail_send().await;
     }
 }
 
@@ -877,51 +1437,13 @@ mod test {
 mod threadtesting {
     use super::*;
     use common::*;
+    use test;
 
     /// Single Producer Single Consumer, one message
     #[rstest::rstest]
     fn spsc_1(#[with("spsc_1")] model: loom::model::Builder) {
         model.check(|| {
-            let (sx, rx) = channel(1);
-            let elem = 42;
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx.queue.writ_indx(), 0);
-            assert_eq!(sx.queue.writ_size(), 1); // closest power of 2
-            assert_eq!(sx.queue.read_indx(), 0);
-            assert_eq!(sx.queue.read_size(), 0);
-
-            let handle = loom::thread::spawn(move || {
-                tracing::info!(elem, "Sending element");
-                assert_matches::assert_matches!(
-                    sx.send(DropCounter::new(vec![elem], counter1)),
-                    None,
-                    "Failed to send value, message queue is {:#?}",
-                    sx.queue
-                );
-            });
-
-            loom::future::block_on(async move {
-                tracing::info!(elem, "Waiting for element");
-                let guard = rx.recv().await;
-                assert_matches::assert_matches!(
-                    guard,
-                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![elem]) },
-                    "Failed to acquire acknowledge guard, message queue is {:#?}",
-                    rx.queue
-                );
-
-                tracing::info!("Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 1)
-            });
-
-            handle.join().unwrap();
+            loom::future::block_on(async { common::spsc_1().await });
         })
     }
 
@@ -929,50 +1451,7 @@ mod threadtesting {
     #[rstest::rstest]
     fn spsc_2(#[with("spsc_2")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx, rx) = channel(3);
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx.queue.writ_indx(), 0);
-            assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
-            assert_eq!(sx.queue.read_indx(), 0);
-            assert_eq!(sx.queue.read_size(), 0);
-
-            let handle = loom::thread::spawn(move || {
-                for i in 0..2 {
-                    tracing::info!(i, "Sending element");
-                    assert_matches::assert_matches!(
-                        sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
-                        None,
-                        "Failed to send {i}, message queue is {:#?}",
-                        sx.queue
-                    )
-                }
-            });
-
-            loom::future::block_on(async move {
-                for i in 0..2 {
-                    tracing::info!(i, "Waiting for element");
-                    let guard = rx.recv().await;
-                    tracing::info!(i, "Received element");
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]) },
-                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-
-                tracing::info!("Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2)
-            });
-
-            handle.join().unwrap();
+            loom::future::block_on(async { common::spsc_2().await });
         })
     }
 
@@ -980,79 +1459,7 @@ mod threadtesting {
     #[rstest::rstest]
     fn spmc(#[with("spmc")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx, rx1) = channel(3);
-            let rx2 = rx1.resubscribe();
-            let rx3 = rx1.resubscribe();
-
-            let witness1 = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::default()));
-            let witness2 = std::sync::Arc::clone(&witness1);
-            let witness3 = std::sync::Arc::clone(&witness1);
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx.queue.writ_indx(), 0);
-            assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
-            assert_eq!(sx.queue.read_indx(), 0);
-            assert_eq!(sx.queue.read_size(), 0);
-
-            let handle1 = loom::thread::spawn(move || {
-                for i in 0..2 {
-                    assert_matches::assert_matches!(
-                        sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
-                        None,
-                        "Failed to send {i}, message queue is {:#?}",
-                        sx.queue
-                    )
-                }
-            });
-
-            let handle2 = loom::thread::spawn(move || {
-                loom::future::block_on(async move {
-                    tracing::info!("Waiting for element");
-                    let guard = rx1.recv().await;
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { witness1.lock().await.push(guard.read_acknowledge().get()) },
-                        "Failed to acquire acknowledge guard, message queue is {:#?}",
-                        rx1.queue
-                    );
-                })
-            });
-
-            let handle3 = loom::thread::spawn(move || {
-                loom::future::block_on(async move {
-                    tracing::info!("Waiting for element");
-                    let guard = rx2.recv().await;
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { witness2.lock().await.push(guard.read_acknowledge().get()) },
-                        "Failed to acquire acknowledge guard, message queue is {:#?}",
-                        rx2.queue
-                    );
-                })
-            });
-
-            handle1.join().unwrap();
-            handle2.join().unwrap();
-            handle3.join().unwrap();
-
-            loom::future::block_on(async move {
-                tracing::info!(?rx3, "Checking close correctness");
-                let guard = rx3.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                let mut witness = witness3.lock().await;
-                witness.sort();
-                tracing::info!(witness = ?*witness, "Checking receive correctness");
-
-                for (expected, actual) in witness.iter().enumerate() {
-                    assert_eq!(*actual, vec![expected]);
-                }
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2);
-            });
+            loom::future::block_on(async { common::spmc().await });
         })
     }
 
@@ -1060,360 +1467,42 @@ mod threadtesting {
     #[rstest::rstest]
     fn mpsc(#[with("mpsc")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx1, rx) = channel(3);
-            let sx2 = sx1.resubscribe();
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-            let counter3 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx1.queue.writ_indx(), 0);
-            assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
-            assert_eq!(sx1.queue.read_indx(), 0);
-            assert_eq!(sx1.queue.read_size(), 0);
-
-            let handle1 = loom::thread::spawn(move || {
-                assert_matches::assert_matches!(
-                    sx1.send(DropCounter::new(vec![42], counter1)),
-                    None,
-                    "Failed to send 42, message queue is {:#?}",
-                    sx1.queue
-                )
-            });
-
-            let handle2 = loom::thread::spawn(move || {
-                assert_matches::assert_matches!(
-                    sx2.send(DropCounter::new(vec![69], counter2)),
-                    None,
-                    "Failed to send 69, message queue is {:#?}",
-                    sx2.queue
-                )
-            });
-
-            loom::future::block_on(async move {
-                let mut res = vec![];
-
-                for i in 0..2 {
-                    tracing::info!("Waiting for element");
-                    let guard = rx.recv().await;
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { res.push(guard.read_acknowledge().get()) },
-                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-
-                tracing::info!("Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                res.sort();
-                tracing::info!(?res, "Checking receive correctness");
-
-                assert_eq!(res.len(), 2);
-                assert_eq!(res[0], vec![42]);
-                assert_eq!(res[1], vec![69]);
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 2);
-            });
-
-            handle1.join().unwrap();
-            handle2.join().unwrap();
+            loom::future::block_on(async { common::mpsc().await });
         })
     }
 
     #[rstest::rstest]
     fn resend(#[with("resend")] model: loom::model::Builder) {
         model.check(|| {
-            let (sx1, rx) = channel(2);
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx1.queue.writ_indx(), 0);
-            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
-            assert_eq!(sx1.queue.read_indx(), 0);
-            assert_eq!(sx1.queue.read_size(), 0);
-
-            let handle = loom::thread::spawn(move || {
-                // Notice that we only send ONE element!
-                tracing::info!("Sending element");
-                assert_matches::assert_matches!(
-                    sx1.send(DropCounter::new(vec![69], counter1)),
-                    None,
-                    "Failed to send 69, message queue is {:#?}",
-                    sx1.queue
-                )
-            });
-
-            loom::future::block_on(async move {
-                // We receive the element once but we do not acknowledge it, so it is added back to
-                // the queue.
-                tracing::info!("Waiting for element");
-                let guard = rx.recv().await;
-                assert_matches::assert_matches!(
-                    guard,
-                    Some(guard) => { assert_eq!(guard.read().get(), vec![69]); },
-                    "Failed to acquire acknowledge guard, message queue is {:#?}",
-                    rx.queue
-                );
-
-                // We receive the element a second time and we acknowledge it...
-                tracing::info!("Waiting for element");
-                let guard = rx.recv().await;
-                assert_matches::assert_matches!(
-                    guard,
-                    Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![69]); },
-                    "Failed to acquire acknowledge guard, message queue is {:#?}",
-                    rx.queue
-                );
-
-                // ...so that the queue is now empty.
-                tracing::info!("Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                // We count 2 drops because calling `MqGuard.read()` creates a clone of the
-                // underlying data (`MqGuard.read_acknowledge` does not).
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter2.load(std::sync::atomic::Ordering::Acquire), 2);
-            });
-
-            handle.join().unwrap();
+            loom::future::block_on(async { common::resend().await });
         })
     }
 
     #[rstest::rstest]
     fn wrap_around(#[with("wrap_around")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx1, rx) = channel(2);
-            let sx2 = sx1.resubscribe();
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-            let counter3 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx1.queue.writ_indx(), 0);
-            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
-            assert_eq!(sx1.queue.read_indx(), 0);
-            assert_eq!(sx1.queue.read_size(), 0);
-
-            let handle = loom::thread::spawn(move || {
-                for i in 0..2 {
-                    tracing::info!(i, "Sending element");
-                    assert_matches::assert_matches!(
-                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
-                        None,
-                        "Failed to send {i}, message queue is {:#?}",
-                        sx1.queue
-                    )
-                }
-            });
-
-            loom::future::block_on(async {
-                for i in 0..2 {
-                    tracing::info!("Waiting for element");
-                    let guard = rx.recv().await;
-                    tracing::info!("Received element");
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
-                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-            });
-            handle.join().unwrap();
-
-            let handle = loom::thread::spawn(move || {
-                for i in 2..4 {
-                    tracing::info!(i, "Sending element");
-                    assert_matches::assert_matches!(
-                        sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))),
-                        None,
-                        "Failed to send {i}, message queue is {:#?}",
-                        sx2.queue
-                    )
-                }
-            });
-
-            loom::future::block_on(async {
-                for i in 2..4 {
-                    tracing::info!("Waiting for element");
-                    let guard = rx.recv().await;
-                    tracing::info!("Received element");
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
-                        "Failed to acquire acknowledge guard {i}, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-
-                tracing::info!(?rx, "Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 4)
-            });
-            handle.join().unwrap();
+            loom::future::block_on(async { common::wrap_around().await });
         })
     }
 
     #[rstest::rstest]
     fn close(#[with("close")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx1, rx) = channel(3);
-            let sx2 = sx1.resubscribe();
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-            let counter3 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx1.queue.writ_indx(), 0);
-            assert_eq!(sx1.queue.writ_size(), 4); // closest power of 2
-            assert_eq!(sx1.queue.read_indx(), 0);
-            assert_eq!(sx1.queue.read_size(), 0);
-
-            let handle1 = loom::thread::spawn(move || {
-                for i in 0..2 {
-                    tracing::info!(i, "Sending element");
-                    sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1)));
-                }
-                sx1.close();
-            });
-
-            let handle2 = loom::thread::spawn(move || {
-                for i in 2..4 {
-                    tracing::info!(i, "Sending element");
-                    sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2)));
-                }
-                sx2.close();
-            });
-
-            handle1.join().unwrap();
-            handle2.join().unwrap();
-
-            loom::future::block_on(async move {
-                tracing::info!(?rx, "Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 4)
-            });
+            loom::future::block_on(async { common::close().await });
         })
     }
 
     #[rstest::rstest]
     fn zst(#[with("zst")] model_bounded: loom::model::Builder) {
         model_bounded.check(|| {
-            let (sx, rx) = channel(3);
-
-            assert_eq!(sx.queue.writ_indx(), 0);
-            assert_eq!(sx.queue.writ_size(), 4); // closest power of 2
-            assert_eq!(sx.queue.read_indx(), 0);
-            assert_eq!(sx.queue.read_size(), 0);
-
-            let handle = loom::thread::spawn(move || {
-                for _ in 0..2 {
-                    tracing::info!("Sending element");
-                    assert_matches::assert_matches!(
-                        sx.send(()),
-                        None,
-                        "Failed to send, message queue is {:#?}",
-                        sx.queue
-                    )
-                }
-            });
-
-            loom::future::block_on(async move {
-                for _ in 0..2 {
-                    tracing::info!("Waiting for element");
-                    let guard = rx.recv().await;
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { guard.acknowledge() },
-                        "Failed to acquire acknowledge guard, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-
-                tracing::info!(?rx, "Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-            });
-
-            handle.join().unwrap();
+            loom::future::block_on(async { common::zst().await });
         })
     }
 
     #[rstest::rstest]
     fn fail_send(#[with("fail_send")] model: loom::model::Builder) {
         model.check(|| {
-            let (sx1, rx) = channel(2);
-            let sx2 = sx1.resubscribe();
-
-            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter2 = std::sync::Arc::clone(&counter1);
-            let counter3 = std::sync::Arc::clone(&counter1);
-
-            assert_eq!(sx1.queue.writ_indx(), 0);
-            assert_eq!(sx1.queue.writ_size(), 2); // closest power of 2
-            assert_eq!(sx1.queue.read_indx(), 0);
-            assert_eq!(sx1.queue.read_size(), 0);
-
-            loom::thread::spawn(move || {
-                for i in 0..2 {
-                    tracing::info!(i, "Sending element");
-                    assert_matches::assert_matches!(
-                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
-                        None,
-                        "Failed to send {i}, message queue is {:#?}",
-                        sx1.queue
-                    )
-                }
-            })
-            .join()
-            .unwrap();
-
-            loom::thread::spawn(move || {
-                tracing::info!("Sending element");
-                assert_matches::assert_matches!(
-                    sx2.send(DropCounter::new(vec![2], counter2)),
-                    Some(counter) => { assert_eq!(counter.get(), vec![2]) },
-                    "Queue should be full! {:#?}",
-                    sx2.queue
-                )
-            })
-            .join()
-            .unwrap();
-
-            loom::future::block_on(async move {
-                for i in 0..2 {
-                    tracing::info!(i, "Waiting for element");
-                    let guard = rx.recv().await;
-                    assert_matches::assert_matches!(
-                        guard,
-                        Some(guard) => { assert_eq!(guard.read_acknowledge().get(), vec![i]); },
-                        "Failed to acquire acknowledge guard, message queue is {:#?}",
-                        rx.queue
-                    );
-                }
-
-                tracing::info!(?rx, "Checking close correctness");
-                let guard = rx.recv().await;
-                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
-
-                // We drop the sent value 3 times:
-                // - in the first two (successful) sends
-                // - in the last (failed) send
-                tracing::info!("Checking drop correctness");
-                assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 3)
-            });
+            loom::future::block_on(async { common::fail_send().await });
         })
     }
 

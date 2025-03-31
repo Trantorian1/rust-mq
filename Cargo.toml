@@ -3,6 +3,11 @@ name = "rust-mq"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+loom = ["dep:loom"]
+proptest = ["dep:proptest", "dep:proptest-state-machine"]
+
 [dependencies]
 
 # Async
@@ -34,8 +39,3 @@ tracing-appender = "0.2.3"
 
 # Errors
 thiserror = "2.0.12"
-
-[features]
-default = []
-loom = ["dep:loom"]
-proptest = ["dep:proptest", "dep:proptest-state-machine"]
