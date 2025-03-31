@@ -63,7 +63,6 @@ pub(crate) mod test {
                 {
                     $($code)+
                 };
-                ()
             }
         }
     }
