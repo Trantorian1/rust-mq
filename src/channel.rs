@@ -373,7 +373,7 @@ impl<'a, T: TBound> MqGuard<'a, T> {
     /// [`Clone`].
     ///
     /// [acknowledges]: Self::acknowledge
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
     pub fn read_acknowledge(mut self) -> T {
         let elem = self.elem_take();
         debug!(?elem, "Acknowledging");
@@ -396,7 +396,7 @@ impl<'a, T: TBound> MqGuard<'a, T> {
 }
 
 impl<T: TBound> MessageQueue<T> {
-    #[tracing::instrument]
+    #[cfg_attr(test, tracing::instrument)]
     fn new(cap: u16) -> Self {
         assert!(cap > 0, "Tried to create a message queue with a capacity < 1");
 
@@ -908,17 +908,17 @@ pub(crate) mod test {
 
     model_bounded! {
         async fn simple_send() {
-            let (sx, rx) = channel(100);
+            let (sx, rx) = channel(4);
             let rx = &rx;
 
             let handle = spawn! {
-                for i in 0..100 {
+                for i in 0..4 {
                     // Sends and receives happen concurrently and lock-free!
                     sx.send(i);
                 }
             };
 
-            for i in 0..100 {
+            for i in 0..4 {
                 // Messages have to be acknowledged explicitly by the receiver, else
                 // they are added back to the queue to avoid message loss.
                 block_on! {
@@ -1092,6 +1092,7 @@ pub(crate) mod test {
                 witness.sort();
                 tracing::info!(witness = ?*witness, "Checking receive correctness");
 
+                assert_eq!(witness.len(), 2);
                 for (expected, actual) in witness.iter().enumerate() {
                     assert_eq!(*actual, vec![expected]);
                 }
@@ -1165,6 +1166,95 @@ pub(crate) mod test {
 
             join!(handle1);
             join!(handle2);
+        }
+    }
+
+    model_bounded! {
+        async fn mpmc() {
+            let (sx1, rx1) = channel(4);
+            let sx2 = sx1.resubscribe();
+            let rx2 = rx1.resubscribe();
+            let rx3 = rx1.resubscribe();
+
+            let counter1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter2 = std::sync::Arc::clone(&counter1);
+            let counter3 = std::sync::Arc::clone(&counter1);
+
+            let witness1 = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::default()));
+            let witness2 = std::sync::Arc::clone(&witness1);
+            let witness3 = std::sync::Arc::clone(&witness1);
+
+            let handle1 = spawn! {
+                for i in 0..2 {
+                    assert_matches::assert_matches!(
+                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx1.queue
+                    )
+                }
+            };
+            let handle2 = spawn! {
+                for i in 2..4 {
+                    assert_matches::assert_matches!(
+                        sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx2.queue
+                    )
+                }
+            };
+            let handle3 = spawn! {
+                block_on! {
+                    for _ in 0..2 {
+                        tracing::info!("Waiting for element");
+                        let guard = rx1.recv().await;
+                        assert_matches::assert_matches!(
+                            guard,
+                            Some(guard) => { witness1.lock().await.push(guard.read_acknowledge().get()) },
+                            "Failed to acquire acknowledge guard, message queue is {:#?}",
+                            rx1.queue
+                        );
+                    }
+                }
+            };
+            let handle4 = spawn! {
+                block_on! {
+                    for _ in 0..2 {
+                        tracing::info!("Waiting for element");
+                        let guard = rx2.recv().await;
+                        assert_matches::assert_matches!(
+                            guard,
+                            Some(guard) => { witness2.lock().await.push(guard.read_acknowledge().get()) },
+                            "Failed to acquire acknowledge guard, message queue is {:#?}",
+                            rx2.queue
+                        );
+                    }
+                }
+            };
+
+            join!(handle1);
+            join!(handle2);
+            join!(handle3);
+            join!(handle4);
+
+            block_on! {
+                tracing::info!(?rx3, "Checking close correctness");
+                let guard = rx3.recv().await;
+                assert!(guard.is_none(), "Guard acquired on supposedly empty message queue: {:?}", guard.unwrap());
+
+                let mut witness = witness3.lock().await;
+                witness.sort();
+                tracing::info!(witness = ?*witness, "Checking receive correctness");
+
+                assert_eq!(witness.len(), 4);
+                for (expected, actual) in witness.iter().enumerate() {
+                    assert_eq!(*actual, vec![expected]);
+                }
+
+                tracing::info!("Checking drop correctness");
+                assert_eq!(counter3.load(std::sync::atomic::Ordering::Acquire), 4);
+            };
         }
     }
 
