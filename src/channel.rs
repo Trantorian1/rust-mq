@@ -126,7 +126,7 @@ pub struct MqGuard<'a, T: TBound> {
 /// [`AtomicU64`]: std::sync::atomic::AtomicU64
 /// [`AtomicBool`]: std::sync::atomic::AtomicBool
 pub struct MessageQueue<T: TBound> {
-    ring: std::ptr::NonNull<AckCell<T>>,
+    ring: RwLock<SendCell<std::ptr::NonNull<AckCell<T>>>>,
     senders: sync::atomic::AtomicUsize,
     read_write: sync::atomic::AtomicU64,
     cap: u16,
@@ -138,6 +138,9 @@ struct AckCell<T: TBound> {
     ack: sync::atomic::AtomicBool,
 }
 
+#[repr(transparent)]
+struct SendCell<T>(T);
+
 unsafe impl<T: TBound> Send for MqSender<T> {}
 unsafe impl<T: TBound> Sync for MqSender<T> {}
 
@@ -146,6 +149,9 @@ unsafe impl<T: TBound> Sync for MqReceiver<T> {}
 
 unsafe impl<T: TBound> Send for MqGuard<'_, T> {}
 unsafe impl<T: TBound> Sync for MqGuard<'_, T> {}
+
+unsafe impl<T> Send for SendCell<T> {}
+unsafe impl<T> Sync for SendCell<T> {}
 
 #[cfg(test)]
 impl<T: TBound> std::fmt::Debug for MqSender<T> {
@@ -181,6 +187,20 @@ impl<T: TBound> std::fmt::Debug for MessageQueue<T> {
     }
 }
 
+impl<T> std::ops::Deref for SendCell<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for SendCell<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl<T: TBound> Drop for MqSender<T> {
     fn drop(&mut self) {
         if !self.close.load(sync::atomic::Ordering::Acquire) {
@@ -208,8 +228,8 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
 
             // This can still fail, but without async drop there isn't really anything better we can
             // do. Should we panic?
-            let res = self.queue.write(elem);
-            debug_assert!(res.is_none());
+            // let res = self.queue.write(elem);
+            // debug_assert!(res.is_none());
         }
     }
 }
@@ -227,12 +247,13 @@ impl<T: TBound> Drop for MessageQueue<T> {
 
         debug!(read_indx, read_size, stop, "Dropping elements");
 
+        let lock = tokio::task::block_in_place(|| self.ring.blocking_write());
         for i in (read_indx..stop).map(|i| fast_mod(i, self.cap)) {
-            unsafe { self.ring.add(i as usize).read() };
+            unsafe { lock.add(i as usize).read() };
         }
 
         let layout = alloc::Layout::array::<AckCell<T>>(self.cap as usize).unwrap();
-        unsafe { alloc::dealloc(self.ring.as_ptr() as *mut u8, layout) }
+        unsafe { alloc::dealloc(lock.as_ptr() as *mut u8, layout) }
     }
 }
 
@@ -272,9 +293,9 @@ impl<T: TBound> MqSender<T> {
 
     /// Sends a value to the underlying [`MessageQueue`] to be received by all its [`MqReceiver`]s
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    pub fn send(&self, elem: T) -> Option<T> {
+    pub async fn send(&self, elem: T) -> Option<T> {
         debug!("Trying to send value");
-        match self.queue.write(elem) {
+        match self.queue.write(elem).await {
             // Failed to write to the queue. This can happen if the next element right after the
             // write region has been read but not acknowledge yet.
             Some(elem) => {
@@ -292,7 +313,7 @@ impl<T: TBound> MqSender<T> {
     // TODO: make is to this returns all the messages which have not been read yet!
     /// Closes the [`MessageQueue`], waking up any [`MqReceiver`] in the process.
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    pub fn close(self) {
+    pub async fn close(self) {
         warn!("Closing channel");
 
         self.queue.sender_unregister_all();
@@ -307,8 +328,9 @@ impl<T: TBound> MqSender<T> {
 
             debug!(read_indx, read_size, stop, "Dropping elements");
 
+            let lock = self.queue.ring.write().await;
             for i in (read_indx..stop).map(|i| fast_mod(i, self.queue.cap)) {
-                unsafe { self.queue.ring.add(i as usize).read().elem.assume_init() };
+                unsafe { lock.add(i as usize).read().elem.assume_init() };
             }
 
             self.waker.notify_waiters();
@@ -335,7 +357,7 @@ impl<T: TBound> MqReceiver<T> {
     pub async fn recv(&self) -> Option<MqGuard<T>> {
         debug!("Trying to receive value");
         loop {
-            match self.queue.read() {
+            match self.queue.read().await {
                 Some(cell_ptr) => {
                     let guard = MqGuard::new(sync::Arc::clone(&self.queue), cell_ptr);
                     debug!("Received value");
@@ -418,6 +440,7 @@ impl<T: TBound> MessageQueue<T> {
             Some(p) => p,
             None => std::alloc::handle_alloc_error(layout),
         };
+        let ring = RwLock::new(SendCell(ring));
 
         let senders = sync::atomic::AtomicUsize::new(0);
         let read_write = sync::atomic::AtomicU64::new(get_raw_bytes(0, cap, 0, 0));
@@ -471,8 +494,9 @@ impl<T: TBound> MessageQueue<T> {
     }
 
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    fn read(&self) -> Option<&mut AckCell<T>> {
+    async fn read(&self) -> Option<&mut AckCell<T>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::SeqCst);
+        let lock = self.ring.read().await;
         loop {
             let writ_indx = get_writ_indx(raw_bytes);
             let writ_size = get_writ_size(raw_bytes);
@@ -545,7 +569,8 @@ impl<T: TBound> MessageQueue<T> {
                     read_size = read_size - 1,
                     "Updated read region"
                 );
-                break Some(unsafe { self.ring.add(read_indx as usize).as_mut() });
+
+                break Some(unsafe { lock.add(read_indx as usize).as_mut() });
             }
         }
     }
@@ -553,8 +578,9 @@ impl<T: TBound> MessageQueue<T> {
     // TODO: we could make this async and wake it up as soon as an elem has been acknowledged so we
     // can try and grow this!
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    fn write(&self, elem: T) -> Option<T> {
+    async fn write(&self, elem: T) -> Option<T> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
+        let lock = self.ring.write().await;
         loop {
             let writ_indx = get_writ_indx(raw_bytes);
             let writ_size = get_writ_size(raw_bytes);
@@ -563,7 +589,7 @@ impl<T: TBound> MessageQueue<T> {
             debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
 
             if writ_size == 0 {
-                if let Ok(bytes) = self.grow_write(raw_bytes) {
+                if let Ok(bytes) = self.grow_write(raw_bytes).await {
                     raw_bytes = bytes;
                     continue;
                 }
@@ -597,14 +623,14 @@ impl<T: TBound> MessageQueue<T> {
                     "Updated write region"
                 );
                 let cell = AckCell::new(elem);
-                unsafe { self.ring.add(writ_indx as usize).write(cell) };
+                unsafe { lock.add(writ_indx as usize).write(cell) };
                 break None;
             }
         }
     }
 
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    fn grow_write(&self, raw_bytes: u64) -> Result<u64, &'static str> {
+    async fn grow_write(&self, raw_bytes: u64) -> Result<u64, &'static str> {
         // We are indexing the element right AFTER the end of the write region to see if we can
         // overwrite it (ie: it has been read and acknowledged)
         let writ_indx = get_writ_indx(raw_bytes);
@@ -637,7 +663,10 @@ impl<T: TBound> MessageQueue<T> {
         // to write to if it has not already been read and acknowledged.
         //
         // See the note in `MqGuard` to understand why we only read the `ack` state!
-        let cell = unsafe { self.ring.add(stop as usize).as_ref() };
+        let cell = {
+            let lock = self.ring.read().await;
+            unsafe { lock.add(stop as usize).as_ref() }
+        };
         let ack = cell.ack.load(sync::atomic::Ordering::Acquire);
 
         // Why would this fail? Consider the following buffer state:
