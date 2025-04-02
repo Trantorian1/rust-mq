@@ -15,6 +15,7 @@ pub(crate) use std::sync;
 pub(crate) use tokio::sync::Notify;
 // #[cfg(not(feature = "loom"))]
 pub(crate) use tokio::sync::RwLock;
+pub(crate) use tokio::sync::RwLockWriteGuard;
 
 #[cfg(feature = "loom")]
 type Wake = sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>;

@@ -223,7 +223,7 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
             // 1. Simply reading the element returns a clone to the user,
             // 2. Read-acknowledging the element does not create a clone but then this would not
             //    execute.
-            let elem = self.elem_take();
+            self.elem_take();
             self.cell.ack.store(true, sync::atomic::Ordering::Release);
 
             // This can still fail, but without async drop there isn't really anything better we can
@@ -247,7 +247,7 @@ impl<T: TBound> Drop for MessageQueue<T> {
 
         debug!(read_indx, read_size, stop, "Dropping elements");
 
-        let lock = tokio::task::block_in_place(|| self.ring.blocking_write());
+        let lock = self.ring.get_mut();
         for i in (read_indx..stop).map(|i| fast_mod(i, self.cap)) {
             unsafe { lock.add(i as usize).read() };
         }
@@ -579,58 +579,57 @@ impl<T: TBound> MessageQueue<T> {
     // can try and grow this!
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     async fn write(&self, elem: T) -> Option<T> {
-        let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
         let lock = self.ring.write().await;
-        loop {
-            let writ_indx = get_writ_indx(raw_bytes);
-            let writ_size = get_writ_size(raw_bytes);
-            let read_indx = get_read_indx(raw_bytes);
-            let read_size = get_read_size(raw_bytes);
-            debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
 
-            if writ_size == 0 {
-                if let Ok(bytes) = self.grow_write(raw_bytes).await {
-                    raw_bytes = bytes;
-                    continue;
-                }
+        let raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
+        let mut writ_indx = get_writ_indx(raw_bytes);
+        let mut writ_size = get_writ_size(raw_bytes);
+        let mut read_indx = get_read_indx(raw_bytes);
+        let mut read_size = get_read_size(raw_bytes);
 
-                debug!("Failed to grow write region");
-                break Some(elem);
+        debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
+
+        if writ_size == 0 {
+            if let Ok(bytes) = self.grow_write(raw_bytes, &lock).await {
+                writ_indx = get_writ_indx(bytes);
+                writ_size = get_writ_size(bytes);
+                read_indx = get_read_indx(bytes);
+                read_size = get_read_size(bytes);
             } else {
-                debug!(writ_indx, "Writing to buffer");
-
-                // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
-                // whatever happens size > 0
-                let writ_indx_new = fast_mod(writ_indx + 1, self.cap);
-                let raw_bytes_new = get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size + 1);
-
-                if let Err(bytes) = self.read_write.compare_exchange(
-                    raw_bytes,
-                    raw_bytes_new,
-                    sync::atomic::Ordering::Release,
-                    sync::atomic::Ordering::Acquire,
-                ) {
-                    debug!(bytes, "Inter-thread update on write region, trying again");
-                    raw_bytes = bytes;
-                    continue;
-                };
-
-                debug!(
-                    writ_indx = writ_indx_new,
-                    writ_size = writ_size - 1,
-                    read_indx,
-                    read_size = read_size + 1,
-                    "Updated write region"
-                );
-                let cell = AckCell::new(elem);
-                unsafe { lock.add(writ_indx as usize).write(cell) };
-                break None;
+                debug!("Failed to grow write region");
+                return Some(elem);
             }
         }
+
+        debug!(writ_indx, "Writing to buffer");
+
+        // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
+        // whatever happens size > 0
+        let writ_indx_new = fast_mod(writ_indx + 1, self.cap);
+        let raw_bytes_new = get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size + 1);
+
+        self.read_write.store(raw_bytes_new, sync::atomic::Ordering::Release);
+
+        debug!(
+            writ_indx = writ_indx_new,
+            writ_size = writ_size - 1,
+            read_indx,
+            read_size = read_size + 1,
+            "Updated write region"
+        );
+
+        let cell = AckCell::new(elem);
+        unsafe { lock.add(writ_indx as usize).write(cell) };
+
+        None
     }
 
-    #[cfg_attr(test, tracing::instrument(skip(self)))]
-    async fn grow_write(&self, raw_bytes: u64) -> Result<u64, &'static str> {
+    #[cfg_attr(test, tracing::instrument(skip(self, lock)))]
+    async fn grow_write<'a>(
+        &self,
+        raw_bytes: u64,
+        lock: &RwLockWriteGuard<'a, SendCell<std::ptr::NonNull<AckCell<T>>>>,
+    ) -> Result<u64, &'static str> {
         // We are indexing the element right AFTER the end of the write region to see if we can
         // overwrite it (ie: it has been read and acknowledged)
         let writ_indx = get_writ_indx(raw_bytes);
@@ -663,10 +662,7 @@ impl<T: TBound> MessageQueue<T> {
         // to write to if it has not already been read and acknowledged.
         //
         // See the note in `MqGuard` to understand why we only read the `ack` state!
-        let cell = {
-            let lock = self.ring.read().await;
-            unsafe { lock.add(stop as usize).as_ref() }
-        };
+        let cell = unsafe { lock.add(stop as usize).as_ref() };
         let ack = cell.ack.load(sync::atomic::Ordering::Acquire);
 
         // Why would this fail? Consider the following buffer state:
