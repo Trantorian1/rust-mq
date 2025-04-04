@@ -37,7 +37,7 @@
 //!     tokio::spawn(async move {
 //!         for i in 0..100 {
 //!             // Sends and receives happen concurrently and lock-free!
-//!             sx.send(i);
+//!             sx.send(i).await;
 //!         }
 //!     });
 //!
