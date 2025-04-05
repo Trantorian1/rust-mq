@@ -59,6 +59,8 @@
 //! [`proptest`] is used to test the system under hundreds of thousands of different send, recv and
 //! drop transitions. On top of this, known edge cases are tested manually to avoid regressions.
 //!
+//! Each test is also run against [Miri] to ensure we are not relying on any undefined behavior.
+//!
 //! While this helps ensure a reasonable level of confidence in the system, this is by no means an
 //! exaustive search as some concurrent execution tests had to be bounded in their exploration of
 //! the problem space due to an exponential explosion in complexity. Similarly, proptest performs
@@ -117,6 +119,7 @@
 //! [receiver]: MqReceiver
 //! [acknowledged]: MqGuard::acknowledge
 //! [`read`]: MqGuard::read
+//! [Miri]: https://github.com/rust-lang/miri
 //! [closing]: MqSender::close
 //! [`resubscribe`]: MqSender::resubscribe
 

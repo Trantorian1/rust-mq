@@ -56,7 +56,7 @@ pub struct MqGuard<'a, T: TBound> {
 ///   initially, this is the whole of the queue.
 ///
 /// - The read region represents a contiguous part of the queue which is reserved for reads:
-///   initially this is empty but fills from the write region as new values are written.
+///   initially this is empty but grows as new values are written.
 ///
 /// - The acknowledge region represents a contiguous part of the queue where values have been read
 ///   but not yet acknowledged. Such values can no longer be read but cannot be overwritten yet.
@@ -81,19 +81,19 @@ pub struct MqGuard<'a, T: TBound> {
 ///    └───────────────────────────────────┘
 /// ```
 ///
-/// The write region will grow as needed during attempted writes. In the above example, the first
-/// two cells of the ring buffer can be overwritten as they have been read and acknowledged, but
-/// the third one is not! Any cell after that cannot be overwritten as it is either part of the
-/// current read or write regions.
+/// The write region will grow as needed during attempted writes. In the above example, cells 0 and
+/// 1 can be overwritten as they have been read and acknowledged, but cell 2 cannot as it has not
+/// been acknowledged yet! Cells 3 till 8 cannot be overwritten as they are part of the current read
+/// or write regions.
 ///
 /// ## Atomicity
 ///
 /// Because of the way the underlying ring buffer is structured, each region has to be updated
 /// atomically as a whole. This means that it should not be possible for a thread to see an update
-/// to the read region that does not coincide with an update to the write region for example (as
-/// this would mean that we are indexing into potentially uninitialized memory -yikes!). To avoid
-/// this, information about the read and write regions are encoded as [`u16`] values inside a single
-/// [`AtomicU64`] as follows:
+/// to the read region that does not coincide with an update to the write region (as this would mean
+/// that we are indexing into potentially uninitialized memory -yikes!). To avoid this, information
+/// about the read and write regions are encoded as [`u16`] values inside a single [`AtomicU64`] as
+/// follows:
 ///
 /// ```text
 /// 0x aaaa bbbb cccc dddd
@@ -109,9 +109,9 @@ pub struct MqGuard<'a, T: TBound> {
 /// ```
 ///
 /// The acknowledge region is a bit more tricky as it can get fragmented since elements can be
-/// acknowledged individually and irrespective of the order in which they are received. This sort
-/// of information is stored as an [`AtomicBool`] inside of each cell. At any point, the ring
-/// buffer might then look something like this:
+/// acknowledged individually and irrespective of the order in which they are received. This extra
+/// information is stored as an [`AtomicBool`] inside of each cell. At any point, the ring buffer
+/// might then look something like this:
 ///
 /// ```text
 ///    ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐
@@ -119,8 +119,8 @@ pub struct MqGuard<'a, T: TBound> {
 ///    └───┴───┴───┴───┴───┴───┴───┴───┴───┘
 /// ```
 ///
-/// Where several non-consecutive cells are have not yet been marked as acknowledged. This is
-/// checked when we try and grow the write region to see if a cell is safe to overwrite.
+/// Where several non-consecutive cells have not yet been acknowledged. This is checked when we try
+/// and grow the write region to make sure we only overwrite cell which have been acknowledged.
 ///
 /// [`AtomicU64`]: std::sync::atomic::AtomicU64
 /// [`AtomicBool`]: std::sync::atomic::AtomicBool
@@ -194,6 +194,8 @@ impl<T: TBound> Drop for MqSender<T> {
 
 impl<T: TBound> Drop for MqGuard<'_, T> {
     fn drop(&mut self) {
+        // TODO: update this section one we have a working implementation
+        //
         // If the element was not acknowledged, we add it back to the queue to be picked up again,
         // taking special care to drop the element in the process. We do not need to do this if the
         // element was acknowledged since the drop logic is implemented in `elem_drop` and this is
@@ -208,8 +210,8 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
             self.elem_take();
             self.cell.ack.store(true, sync::atomic::Ordering::Release);
 
-            // This can still fail, but without async drop there isn't really anything better we can
-            // do. Should we panic?
+            // TODO: fix this by allocating double the buffer size
+            //
             // let res = self.queue.write(elem);
             // debug_assert!(res.is_none());
         }
@@ -305,14 +307,14 @@ impl<T: TBound> MqSender<T> {
         let mut read_indx = get_read_indx(raw_bytes);
         let mut read_size = get_read_size(raw_bytes);
 
-        // This is very important!
+        //                               THIS IS VERY IMPORTANT!
         //
         // It is still possible for a value to be sent while we are closing the channel! This can
-        // happen if a sender has already begun to send that value before we could update the write
+        // happen if a sender has already begun to send that value before we could set the write
         // region to 0. IN THAT CASE (and because of how the write method works to guarantee
         // atomicity), it is possible that the read region will be updated AFTER the channel has
         // been closed. While no new values can be sent, this means that some values could still be
-        // written to the queue which need to be freed!
+        // written to the queue while we are closing it! This need to be taken into account.
         //
         // # An incorrect approach
         //
@@ -335,7 +337,7 @@ impl<T: TBound> MqSender<T> {
         // - The read region is currently { indx: 0, size: 3 }
         // - The write region is currently { indx: 3, size: 4 }
         //
-        // 2. Another thread updates the write region. (Thread B)
+        // 2. Another thread updates the write region as part of the `write` method. (Thread B)
         //
         // - The read region is currently { indx: 0, size: 3 }
         // - The write region is currently { indx: 4, size: 3 }
@@ -345,7 +347,7 @@ impl<T: TBound> MqSender<T> {
         // - The read region is currently { indx: 0, size: 0 }
         // - The write region is currently { indx: 0, size: 0 }
         //
-        // 4. Another thread updates the read region. (Thread B)
+        // 4. Another thread increments the read region as part of the `write` method. (Thread B)
         //
         // - The read region is currently { indx: 0, size: 1 }
         // - The write region is currently { indx: 0, size: 0 }
@@ -391,17 +393,17 @@ impl<T: TBound> MqSender<T> {
         // - The read region is currently { indx: 0, size: 3 }
         // - The write region is currently { indx: 3, size: 4 }
         //
-        // 2. Another thread updates the write region. (Thread B)
+        // 2. Another thread updates the write region as part of the `write` method. (Thread B)
         //
         // - The read region is currently { indx: 0, size: 4 }
         // - The write region is currently { indx: 4, size: 3 }
         //
-        // 3. We update the read/write region. (Thread A)
+        // 3. We update the read/write region. Notice the change in `indx`! (Thread A)
         //
         // - The read region is currently { indx: 3, size: 0 }
         // - The write region is currently { indx: 0, size: 0 }
         //
-        // 4. Another thread updates the read region. (Thread B)
+        // 4. Another thread updates the read region as part of the `write` method. (Thread B)
         //
         // - The read region is currently { indx: 3, size: 1 }
         // - The write region is currently { indx: 0, size: 0 }
@@ -409,7 +411,7 @@ impl<T: TBound> MqSender<T> {
         // 5. We free elements from index 0 to 2, the state of the queue is now:
         //
         //    ┌───┬───┬───┬───┬───┬───┬───┐
-        // B: │ f │ f │ f │ r │ x │ x │ x │
+        // B: │ f │ f │ f │r/e│ x │ x │ x │
         //    └───┴───┴───┴───┴───┴───┴───┘
         //      0   1   2   3   4   5   6
         //
@@ -423,7 +425,6 @@ impl<T: TBound> MqSender<T> {
         //
         // This is a valid state! When this functions is called again or the queue is dropped, the
         // element at index 3 will be freed appropriately.
-        //
         loop {
             let read_indx_new = fast_mod(read_indx + read_size, self.queue.cap);
             let raw_bytes_new = get_raw_bytes(0, 0, read_indx_new, 0);
@@ -550,8 +551,8 @@ impl<T: TBound> MessageQueue<T> {
         // The size, when rounded up to the nearest multiple of align, does not overflow isize (i.e.
         // the rounded value will always be less than or equal to isize::MAX)."
         //
-        // I could not find anything in the source code of this method that checks that so making
-        // sure here, is this really necessary?
+        // I could not find anything in the source code of this method that checks this, is this
+        // really necessary?
         assert!(layout.size() <= isize::MAX as usize);
 
         debug!(?layout, "Allocating layout");
@@ -596,6 +597,7 @@ impl<T: TBound> MessageQueue<T> {
         senders > 0
     }
 
+    // TODO: refactor this into a single method
     fn writ_indx(&self) -> u16 {
         get_writ_indx(self.read_write.load(sync::atomic::Ordering::Acquire))
     }
@@ -651,9 +653,9 @@ impl<T: TBound> MessageQueue<T> {
                 //
                 // `compare_exchange` allows us to work around this problem by updating an atomic
                 // _only if its value has not changed from what we expect_. In other words, we ask
-                // it to update `strt_and_size` only if `strt_and_size` has not been changed by
-                // another thread in the meantime. If this is not the case, we re-try the whole
-                // operations (checking `size`, computing `strt_new`, `size_new`) with the updated
+                // it to update `read_write` only if `read_write` has not been changed by another
+                // thread in the meantime. If this is not the case, we re-try the whole operations
+                // (checking `size`, computing `strt_new` and `size_new`) with this updated
                 // information.
                 //
                 // We are making two assumptions here:
@@ -666,9 +668,9 @@ impl<T: TBound> MessageQueue<T> {
                 // Assumption [1] is satisfied by the fact that if other readers or writers keep
                 // updating the message queue, we will eventually reach the condition `size == 0` or
                 // we will succeed in a write. We can assume this since the operations between loop
-                // cycles are very simple (in the order of single instructions), therefore it is
-                // reasonable to expect we will NOT keep missing the store, which satisfiesS
-                // assumption [2].
+                // cycles are very simple (in the order of single instructions), which satisfies
+                // assumption [2], therefore it is reasonable to expect we will NOT keep missing the
+                // store.
                 if let Err(bytes) = self.read_write.compare_exchange(
                     raw_bytes,
                     raw_bytes_new,
@@ -693,8 +695,6 @@ impl<T: TBound> MessageQueue<T> {
         }
     }
 
-    // TODO: we could make this async and wake it up as soon as an elem has been acknowledged so we
-    // can try and grow this!
     #[cfg_attr(test, tracing::instrument(skip(self)))]
     fn write(&self, elem: T) -> Option<T> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
@@ -711,7 +711,7 @@ impl<T: TBound> MessageQueue<T> {
         //
         // We update the write region, moving on to the next element and decreasing its size by 1.
         // This acts as a locking mechanism where the sender races against other threads to reserve
-        // a writing index. If the sender looses the race (ie: read_write is updated by another
+        // a writing index. If the sender looses the race (ie: `read_write` is updated by another
         // thread) then it tries again, exiting if the write region now has a size of 0.
         //
         // # Step 2
@@ -816,7 +816,7 @@ impl<T: TBound> MessageQueue<T> {
         //
         // 1. We do not allow to create a empty write region.
         // 2. We only ever call grow if we have no more space left to write.
-        // 3. A write region should initially cover the entirety of the array being written to.
+        // 3. A write region should initially cover the entirety of the queue.
         //
         // Inv. [1] and Inv. [3] guarantee that we are not writing into an empty array.
         // Consequentially, Inv. [2] guarantees that if there is no more space left to write, then
@@ -824,10 +824,8 @@ impl<T: TBound> MessageQueue<T> {
         // written to previously.
         //
         // Note that the `ack` state of that value/cell might have been updated by a `MqGuard` in
-        // the meantime, which is what we are checking for: we cannot grow and mark a value as ready
-        // to write to if it has not already been read and acknowledged.
-        //
-        // See the note in `MqGuard` to understand why we only read the `ack` state!
+        // the meantime, which is what we are checking for: we cannot overwrite a value until it
+        // has been acknowledged.
         let cell = unsafe { self.ring.add(stop as usize).as_ref() };
         let ack = cell.ack.load(sync::atomic::Ordering::Acquire);
 
@@ -850,7 +848,8 @@ impl<T: TBound> MessageQueue<T> {
         // cannot overwrite it as another thread might read it in the future! In contrary, the
         // elements at index 1 and 2 have been read and acknowledged, meaning they are safe to
         // overwrite. However, since element 0 precedes them, we cannot grow the write region to
-        // encompass them.
+        // encompass them. This is because we want to maintain the invariant that the read/write
+        // regions are _contiguous_.
         //
         // This is done to avoid fragmenting the buffer and keep read and write operations simple
         // and efficient.
@@ -1006,11 +1005,12 @@ pub mod common {
 /// This will begin by running loom with no logs, checking all possible permutations of
 /// multithreaded operations for our program (actually this tests _most_ permutations, with
 /// limitations in regard to [SeqCst] and [Relaxed] ordering, but since we do not use those loom
-/// will be exploring the full concurrent permutations). If an invariant is violated, this will
-/// cause the test to fail and the fail state will be saved under `LOOM_CHECKPOINT_FILE`.
+/// will be exploring the full concurrent permutations, given enough time -and this can be a long
+/// time). If an invariant is violated, this will cause the test to fail and the fail state to be
+/// saved under `LOOM_CHECKPOINT_FILE`.
 ///
 /// > We do not enable logs for this first run as loom might simulate many thousand permutations
-/// > before finding a single failing case, and this would polute `stdout`. Also, we run in
+/// > before finding a single failing case, and this would pollute `stdout`. Also, we run in
 /// > `release` mode to make this process faster.
 ///
 /// Once a failing case has been identified, resume the tests with:
@@ -1023,14 +1023,15 @@ pub mod common {
 /// single iteration of the test will be run before the failure is caught.
 ///
 /// > Note that if ever you update the code of a test, you will then need to delete
-/// > `LOOM_CHECKPOINT_FILE` before running the tests again. Otherwise loom will complain about
+/// > `LOOM_CHECKPOINT_FILE` before running the tests again, otherwise loom will complain about
 /// > having reached an unexpected execution path.
 ///
 /// # Complexity explosion
 ///
 /// Due to the way in which loom checks for concurrent access permutations, execution time will grow
 /// exponentially with the size of the model. For this reason, some particularly demanding tests
-/// are configured to prune branches which are less likely to reveal bugs.
+/// are configured to prune branches which are less likely to reveal bugs. It does not take much
+/// for a test to become demanding so most tests here use pruning in combination with a time limit.
 ///
 /// From the loom docs:
 ///
@@ -1041,8 +1042,34 @@ pub mod common {
 /// > one runs in its place. In practice, setting the thread pre-emption bound to 2 or 3 is enough
 /// > to catch most bugs while significantly reducing the number of possible executions."_
 ///
+/// # Test duplication
+///
+/// We are not _only_ writing multithreaded code, we are also writing _asynchronous_ code. For this
+/// reason, we want to be able to run the same test under [`loom`] _and_ [`tokio`]. To avoid having
+/// to write the same test multiple times, we use a series of macros which unify the API calls
+/// between `loom` and `tokio`, so we can write a test once and have the compiler generate both
+/// versions for us.
+///
+/// To run only the tokio version of each test, simply run:
+///
+/// ```bash
+/// cargo test --release
+/// ```
+///
+/// # Miri
+///
+/// We also run [Miri] on each test to ensure we do not rely on any undefinded behavior. To run the
+/// Miri version of each test, you can use:
+///
+/// ```bash
+/// MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test
+/// ```
+///
+/// Note that this requires you to have Miri installed on your system.
+///
 /// [SeqCst]: std::sync::atomic::Ordering::SeqCst
 /// [Relaxed]: std::sync::atomic::Ordering::Relaxed
+/// [Miri]: https://github.com/rust-lang/miri
 #[cfg(all(test, not(feature = "proptest")))]
 pub(crate) mod test {
     use super::*;
@@ -1758,6 +1785,10 @@ pub(crate) mod test {
 /// At the same time, we can test for many, many more scenarios that we could ever write by hand
 /// (the test below for example will simulate an average 262,144 different transitions and ensure
 /// they are all valid).
+///
+/// Check out the [proptest book] if you are curious and want to learn more.
+///
+/// [proptest book]: https://proptest-rs.github.io/proptest/proptest/index.html
 #[cfg(all(test, feature = "proptest"))]
 mod proptesting {
     use super::*;
@@ -1907,7 +1938,7 @@ mod proptesting {
             Self { sxs: std::collections::VecDeque::from([sx]), rxs: std::collections::VecDeque::from([rx]) }
         }
 
-        #[tracing::instrument(skip(state))]
+        #[tracing::instrument(skip_all)]
         fn apply(
             mut state: Self::SystemUnderTest,
             ref_state: &<Self::Reference as ReferenceStateMachine>::State,
