@@ -62,6 +62,8 @@ To ensure correctness, `rust-mq` is thoroughly tested under many different scena
 is used to fuzz hundreds of thousands of concurrent execution pathways and drop calls and
 [`proptest`] is used to test the system under hundreds of thousands of different send, recv and
 drop transitions. On top of this, known edge cases are tested manually to avoid regressions.
+
+Each test is also run against [`miri`] to ensure we are not relying on any undefined behavior.
  
 While this helps ensure a reasonable level of confidence in the system, this is by no means an
 exaustive search as some concurrent execution tests had to be bounded in their exploration of
@@ -72,4 +74,5 @@ Still, this gives us strong guarantees that `rust-mq` works as intended.
 
 [`loom`]: https://github.com/tokio-rs/loom 
 [`proptest`]: https://github.com/proptest-rs/proptest
+[`miri`]: https://github.com/rust-lang/miri
 
