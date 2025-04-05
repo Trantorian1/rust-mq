@@ -4,8 +4,6 @@ pub(crate) use loom::alloc;
 pub(crate) use loom::sync;
 #[cfg(feature = "loom")]
 pub(crate) use loom::sync::Notify;
-// #[cfg(feature = "loom")]
-// pub(crate) use loom::sync::RwLock;
 
 #[cfg(not(feature = "loom"))]
 pub(crate) use std::alloc;
@@ -13,9 +11,6 @@ pub(crate) use std::alloc;
 pub(crate) use std::sync;
 #[cfg(not(feature = "loom"))]
 pub(crate) use tokio::sync::Notify;
-// #[cfg(not(feature = "loom"))]
-pub(crate) use tokio::sync::RwLock;
-pub(crate) use tokio::sync::RwLockWriteGuard;
 
 #[cfg(feature = "loom")]
 type Wake = sync::Mutex<std::collections::VecDeque<sync::Arc<Notify>>>;

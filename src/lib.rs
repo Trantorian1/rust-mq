@@ -32,12 +32,14 @@
 //! ```rust
 //! #[tokio::main]
 //! async fn main() {
+//! #   #[cfg(not(feature = "loom"))]
+//! #   {
 //!     let (sx, rx) = rust_mq::channel(100);
 //!
 //!     tokio::spawn(async move {
 //!         for i in 0..100 {
 //!             // Sends and receives happen concurrently and lock-free!
-//!             sx.send(i).await;
+//!             sx.send(i);
 //!         }
 //!     });
 //!
@@ -46,6 +48,7 @@
 //!         // they are added back to the queue to avoid message loss.
 //!         assert_eq!(rx.recv().await.unwrap().read_acknowledge(), i);
 //!     };
+//! #   }
 //! }
 //! ```
 //!

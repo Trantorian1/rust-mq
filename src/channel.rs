@@ -125,7 +125,7 @@ pub struct MqGuard<'a, T: TBound> {
 /// [`AtomicU64`]: std::sync::atomic::AtomicU64
 /// [`AtomicBool`]: std::sync::atomic::AtomicBool
 pub struct MessageQueue<T: TBound> {
-    ring: RwLock<SendCell<std::ptr::NonNull<AckCell<T>>>>,
+    ring: std::ptr::NonNull<AckCell<T>>,
     senders: sync::atomic::AtomicUsize,
     read_write: sync::atomic::AtomicU64,
     cap: u16,
@@ -137,9 +137,6 @@ struct AckCell<T: TBound> {
     ack: sync::atomic::AtomicBool,
 }
 
-#[repr(transparent)]
-struct SendCell<T>(T);
-
 unsafe impl<T: TBound> Send for MqSender<T> {}
 unsafe impl<T: TBound> Sync for MqSender<T> {}
 
@@ -149,8 +146,8 @@ unsafe impl<T: TBound> Sync for MqReceiver<T> {}
 unsafe impl<T: TBound> Send for MqGuard<'_, T> {}
 unsafe impl<T: TBound> Sync for MqGuard<'_, T> {}
 
-unsafe impl<T> Send for SendCell<T> {}
-unsafe impl<T> Sync for SendCell<T> {}
+unsafe impl<T: TBound> Send for MessageQueue<T> {}
+unsafe impl<T: TBound> Sync for MessageQueue<T> {}
 
 #[cfg(test)]
 impl<T: TBound> std::fmt::Debug for MqSender<T> {
@@ -183,20 +180,6 @@ impl<T: TBound> std::fmt::Debug for MessageQueue<T> {
             .field("read_write", &read_write)
             .field("cap", &self.cap)
             .finish()
-    }
-}
-
-impl<T> std::ops::Deref for SendCell<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> std::ops::DerefMut for SendCell<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }
 
@@ -246,13 +229,12 @@ impl<T: TBound> Drop for MessageQueue<T> {
 
         debug!(read_indx, read_size, stop, "Dropping elements");
 
-        let lock = self.ring.get_mut();
         for i in (read_indx..stop).map(|i| fast_mod(i, self.cap)) {
-            unsafe { lock.add(i as usize).read() };
+            unsafe { self.ring.add(i as usize).read() };
         }
 
         let layout = alloc::Layout::array::<AckCell<T>>(self.cap as usize).unwrap();
-        unsafe { alloc::dealloc(lock.as_ptr() as *mut u8, layout) }
+        unsafe { alloc::dealloc(self.ring.as_ptr() as *mut u8, layout) }
     }
 }
 
@@ -293,9 +275,9 @@ impl<T: TBound> MqSender<T> {
 
     /// Sends a value to the underlying [`MessageQueue`] to be received by all its [`MqReceiver`]s
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    pub async fn send(&self, elem: T) -> Option<T> {
+    pub fn send(&self, elem: T) -> Option<T> {
         debug!("Trying to send value");
-        match self.queue.write(elem).await {
+        match self.queue.write(elem) {
             // Failed to write to the queue. This can happen if the next element right after the
             // write region has been read but not acknowledge yet.
             Some(elem) => {
@@ -313,28 +295,166 @@ impl<T: TBound> MqSender<T> {
     // TODO: make is to this returns all the messages which have not been read yet!
     /// Closes the [`MessageQueue`], waking up any [`MqReceiver`] in the process.
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    pub async fn close(self) {
+    pub fn close(self) {
         warn!("Closing channel");
-        let lock = self.queue.ring.write().await;
 
         self.queue.sender_unregister_all();
-        self.close.swap(true, sync::atomic::Ordering::AcqRel);
-        let raw_bytes = self.queue.read_write.swap(0, sync::atomic::Ordering::AcqRel);
+        self.close.store(true, sync::atomic::Ordering::Release);
 
-        if raw_bytes != 0 {
-            // Cast to u64 to avoid overflow
-            let read_indx = get_read_indx(raw_bytes) as u64;
-            let read_size = get_read_size(raw_bytes) as u64;
-            let stop = read_indx + read_size;
+        let mut raw_bytes = self.queue.read_write.load(sync::atomic::Ordering::Acquire);
+        let mut read_indx = get_read_indx(raw_bytes);
+        let mut read_size = get_read_size(raw_bytes);
 
-            debug!(read_indx, read_size, stop, "Dropping elements");
+        // This is very important!
+        //
+        // It is still possible for a value to be sent while we are closing the channel! This can
+        // happen if a sender has already begun to send that value before we could update the write
+        // region to 0. IN THAT CASE (and because of how the write method works to guarantee
+        // atomicity), it is possible that the read region will be updated AFTER the channel has
+        // been closed. While no new values can be sent, this means that some values could still be
+        // written to the queue which need to be freed!
+        //
+        // # An incorrect approach
+        //
+        // Consider what would happen if we just set the read/write region to 0:
+        //
+        //    ┌───┬───┬───┬───┬───┬───┬───┐
+        // B: │ r │ r │ r │ w │ w │ w │ w │
+        //    └───┴───┴───┴───┴───┴───┴───┘
+        //      0   1   2   3   4   5   6
+        //
+        //    ┌───────────────────────────────────┐
+        //    │ .B: buffer                        │
+        //    │ .r: read region                   │
+        //    │ .w: write region                  │
+        //    └───────────────────────────────────┘
+        //
+        // 1. Another thread starts writing to the queue and reads the state of the current
+        //    read/write region. (Thread B)
+        //
+        // - The read region is currently { indx: 0, size: 3 }
+        // - The write region is currently { indx: 3, size: 4 }
+        //
+        // 2. Another thread updates the write region. (Thread B)
+        //
+        // - The read region is currently { indx: 0, size: 3 }
+        // - The write region is currently { indx: 4, size: 3 }
+        //
+        // 3. We set the read and write region to 0. (Thread A)
+        //
+        // - The read region is currently { indx: 0, size: 0 }
+        // - The write region is currently { indx: 0, size: 0 }
+        //
+        // 4. Another thread updates the read region. (Thread B)
+        //
+        // - The read region is currently { indx: 0, size: 1 }
+        // - The write region is currently { indx: 0, size: 0 }
+        //
+        // 5. We free elements from index 0 to 2, the state of the queue is now:
+        //
+        //    ┌───┬───┬───┬───┬───┬───┬───┐
+        // B: │r/f│ f │ f │ e │ x │ x │ x │
+        //    └───┴───┴───┴───┴───┴───┴───┘
+        //      0   1   2   3   4   5   6
+        //
+        //    ┌───────────────────────────────────┐
+        //    │ .B: buffer                        │
+        //    │ .r: read region                   │
+        //    │ .f: element freed by thread A     │
+        //    │ .e: element added by thread B     │
+        //    │ .x: empty region                  │
+        //    └───────────────────────────────────┘
+        //
+        // This is an invalid state! When this function is called again or the queue is dropped,
+        // the element at index 0 will be dropped again which will result in a double free!
+        //
+        // ---
+        //
+        // # A correct approach
+        //
+        // Now consider instead what we are ACTUALLY doing:
+        //
+        //    ┌───┬───┬───┬───┬───┬───┬───┐
+        // B: │ r │ r │ r │ w │ w │ w │ w │
+        //    └───┴───┴───┴───┴───┴───┴───┘
+        //      0   1   2   3   4   5   6
+        //
+        //    ┌───────────────────────────────────┐
+        //    │ .B: buffer                        │
+        //    │ .r: read region                   │
+        //    │ .w: write region                  │
+        //    └───────────────────────────────────┘
+        //
+        // 1. Another thread starts writing to the queue and reads the state of the current
+        //    read/write region. (Thread B)
+        //
+        // - The read region is currently { indx: 0, size: 3 }
+        // - The write region is currently { indx: 3, size: 4 }
+        //
+        // 2. Another thread updates the write region. (Thread B)
+        //
+        // - The read region is currently { indx: 0, size: 4 }
+        // - The write region is currently { indx: 4, size: 3 }
+        //
+        // 3. We update the read/write region. (Thread A)
+        //
+        // - The read region is currently { indx: 3, size: 0 }
+        // - The write region is currently { indx: 0, size: 0 }
+        //
+        // 4. Another thread updates the read region. (Thread B)
+        //
+        // - The read region is currently { indx: 3, size: 1 }
+        // - The write region is currently { indx: 0, size: 0 }
+        //
+        // 5. We free elements from index 0 to 2, the state of the queue is now:
+        //
+        //    ┌───┬───┬───┬───┬───┬───┬───┐
+        // B: │ f │ f │ f │ r │ x │ x │ x │
+        //    └───┴───┴───┴───┴───┴───┴───┘
+        //      0   1   2   3   4   5   6
+        //
+        //    ┌───────────────────────────────────┐
+        //    │ .B: buffer                        │
+        //    │ .r: read region                   │
+        //    │ .f: element freed by thread A     │
+        //    │ .e: element added by thread B     │
+        //    │ .x: empty region                  │
+        //    └───────────────────────────────────┘
+        //
+        // This is a valid state! When this functions is called again or the queue is dropped, the
+        // element at index 3 will be freed appropriately.
+        //
+        loop {
+            let read_indx_new = fast_mod(read_indx + read_size, self.queue.cap);
+            let raw_bytes_new = get_raw_bytes(0, 0, read_indx_new, 0);
 
-            for i in (read_indx..stop).map(|i| fast_mod(i, self.queue.cap)) {
-                unsafe { lock.add(i as usize).read().elem.assume_init() };
+            if let Err(bytes) = self.queue.read_write.compare_exchange(
+                raw_bytes,
+                raw_bytes_new,
+                sync::atomic::Ordering::Release,
+                sync::atomic::Ordering::Acquire,
+            ) {
+                read_indx = get_read_indx(bytes);
+                read_size = get_read_size(bytes);
+                raw_bytes = bytes;
+                continue;
+            } else {
+                break;
             }
-
-            self.waker.notify_waiters();
         }
+
+        // Cast to u64 to avoid overflow
+        let read_indx = read_indx as u64;
+        let read_size = read_size as u64;
+        let stop = read_indx + read_size;
+
+        debug!(read_indx, read_size, stop, "Dropping elements");
+
+        for i in (read_indx..stop).map(|i| fast_mod(i, self.queue.cap)) {
+            unsafe { self.queue.ring.add(i as usize).read().elem.assume_init() };
+        }
+
+        self.waker.notify_waiters();
     }
 }
 
@@ -357,7 +477,7 @@ impl<T: TBound> MqReceiver<T> {
     pub async fn recv(&self) -> Option<MqGuard<T>> {
         debug!("Trying to receive value");
         loop {
-            match self.queue.read().await {
+            match self.queue.read() {
                 Some(cell_ptr) => {
                     let guard = MqGuard::new(cell_ptr);
                     debug!("Received value");
@@ -440,7 +560,6 @@ impl<T: TBound> MessageQueue<T> {
             Some(p) => p,
             None => std::alloc::handle_alloc_error(layout),
         };
-        let ring = RwLock::new(SendCell(ring));
 
         let senders = sync::atomic::AtomicUsize::new(0);
         let read_write = sync::atomic::AtomicU64::new(get_raw_bytes(0, cap, 0, 0));
@@ -494,8 +613,7 @@ impl<T: TBound> MessageQueue<T> {
     }
 
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    async fn read(&self) -> Option<&mut AckCell<T>> {
-        let lock = self.ring.read().await;
+    fn read(&self) -> Option<&mut AckCell<T>> {
         let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
         loop {
             let writ_indx = get_writ_indx(raw_bytes);
@@ -570,7 +688,7 @@ impl<T: TBound> MessageQueue<T> {
                     "Updated read region"
                 );
 
-                break Some(unsafe { lock.add(read_indx as usize).as_mut() });
+                break Some(unsafe { self.ring.add(read_indx as usize).as_mut() });
             }
         }
     }
@@ -578,9 +696,8 @@ impl<T: TBound> MessageQueue<T> {
     // TODO: we could make this async and wake it up as soon as an elem has been acknowledged so we
     // can try and grow this!
     #[cfg_attr(test, tracing::instrument(skip(self)))]
-    async fn write(&self, elem: T) -> Option<T> {
-        let lock = self.ring.write().await;
-        let raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
+    fn write(&self, elem: T) -> Option<T> {
+        let mut raw_bytes = self.read_write.load(sync::atomic::Ordering::Acquire);
         let mut writ_indx = get_writ_indx(raw_bytes);
         let mut writ_size = get_writ_size(raw_bytes);
         let mut read_indx = get_read_indx(raw_bytes);
@@ -588,47 +705,97 @@ impl<T: TBound> MessageQueue<T> {
 
         debug!(writ_indx, writ_size, read_indx, read_size, "Trying to write to buffer");
 
-        if writ_size == 0 {
-            if let Ok(bytes) = self.grow_write(raw_bytes, &lock).await {
+        // Writing to the buffer takes place in two steps to guarantee atomicity:
+        //
+        // # Step 1
+        //
+        // We update the write region, moving on to the next element and decreasing its size by 1.
+        // This acts as a locking mechanism where the sender races against other threads to reserve
+        // a writing index. If the sender looses the race (ie: read_write is updated by another
+        // thread) then it tries again, exiting if the write region now has a size of 0.
+        //
+        // # Step 2
+        //
+        // We write to the writing index which was reserved in step 1. Once that is done, we increase
+        // the read region by 1, signaling that a new element is ready to be read. Crucially, the
+        // update to the read region is only done AFTER we have written the element, so there is no
+        // possibility for a data race.
+        //
+        // # Caveats
+        //
+        // One important consideration to keep in mind is that the read region and the write region
+        // are stored in the SAME atomic integer. This, and the use of `Release` as store ordering
+        // guarantees that step 2 will ALWAYS be seen AFTER step 1 across threads. Take a moment to
+        // think about this: if we were using two separate atomic integers for the read and write
+        // regions, then the updates to each region would be atomic in of themselves, but there
+        // would be no way to make sure that other threads wouldn't read the state of step 2 BEFORE
+        // step 1.
+        //
+        // Consider the following example:
+        //
+        // - We update the write region (Thread A).
+        // - Another thread reads the state of the read region (Thread B).
+        // - We update the read region (Thread A). Thread B does not see this!
+        // - Another thread reads the state of the write region (Thread B).
+        //
+        // Notice that in this case, thread B is seeing a partial update to the global state of the
+        // read/write region! This is not possible in our case since we are operating on the same
+        // atomic integer and so updates can be globally ordered.
+        loop {
+            // Step 1
+            if writ_size == 0 {
+                if let Ok(bytes) = self.grow_write(raw_bytes) {
+                    writ_indx = get_writ_indx(bytes);
+                    writ_size = get_writ_size(bytes);
+                    read_indx = get_read_indx(bytes);
+                    read_size = get_read_size(bytes);
+                    raw_bytes = bytes;
+                } else {
+                    debug!("Failed to grow write region");
+                    return Some(elem);
+                }
+            }
+
+            // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
+            // whatever happens size > 0
+            let writ_indx_new = fast_mod(writ_indx + 1, self.cap);
+            let raw_bytes_new = get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size);
+
+            debug!(writ_indx = writ_indx_new, "Trying to update write region");
+
+            if let Err(bytes) = self.read_write.compare_exchange(
+                raw_bytes,
+                raw_bytes_new,
+                sync::atomic::Ordering::Release,
+                sync::atomic::Ordering::Acquire,
+            ) {
                 writ_indx = get_writ_indx(bytes);
                 writ_size = get_writ_size(bytes);
                 read_indx = get_read_indx(bytes);
                 read_size = get_read_size(bytes);
-            } else {
-                debug!("Failed to grow write region");
-                return Some(elem);
+                raw_bytes = bytes;
+                continue;
             }
+
+            debug!(writ_indx = writ_indx_new, writ_size = writ_size - 1, "Updated write region");
+
+            break;
         }
 
+        // Step 2
         debug!(writ_indx, "Writing to buffer");
 
-        // size - 1 is checked above and `grow` will increment size by 1 if it succeeds, so
-        // whatever happens size > 0
-        let writ_indx_new = fast_mod(writ_indx + 1, self.cap);
-        let raw_bytes_new = get_raw_bytes(writ_indx_new, writ_size - 1, read_indx, read_size + 1);
-
-        self.read_write.store(raw_bytes_new, sync::atomic::Ordering::Release);
-
-        debug!(
-            writ_indx = writ_indx_new,
-            writ_size = writ_size - 1,
-            read_indx,
-            read_size = read_size + 1,
-            "Updated write region"
-        );
-
         let cell = AckCell::new(elem);
-        unsafe { lock.add(writ_indx as usize).write(cell) };
+        unsafe { self.ring.add(writ_indx as usize).write(cell) };
+        self.read_write.fetch_add(1, sync::atomic::Ordering::AcqRel); // Increments read size
+
+        debug!(read_indx, read_size = read_size + 1, "Updated read region");
 
         None
     }
 
-    #[cfg_attr(test, tracing::instrument(skip(self, lock)))]
-    async fn grow_write(
-        &self,
-        raw_bytes: u64,
-        lock: &RwLockWriteGuard<'_, SendCell<std::ptr::NonNull<AckCell<T>>>>,
-    ) -> Result<u64, &'static str> {
+    #[cfg_attr(test, tracing::instrument(skip(self)))]
+    fn grow_write(&self, raw_bytes: u64) -> Result<u64, &'static str> {
         // We are indexing the element right AFTER the end of the write region to see if we can
         // overwrite it (ie: it has been read and acknowledged)
         let writ_indx = get_writ_indx(raw_bytes);
@@ -661,7 +828,7 @@ impl<T: TBound> MessageQueue<T> {
         // to write to if it has not already been read and acknowledged.
         //
         // See the note in `MqGuard` to understand why we only read the `ack` state!
-        let cell = unsafe { lock.add(stop as usize).as_ref() };
+        let cell = unsafe { self.ring.add(stop as usize).as_ref() };
         let ack = cell.ack.load(sync::atomic::Ordering::Acquire);
 
         // Why would this fail? Consider the following buffer state:
@@ -786,6 +953,7 @@ pub mod common {
         #[with(path)] mut model: loom::model::Builder,
     ) -> loom::model::Builder {
         model.preemption_bound = Some(3);
+        model.max_duration = Some(std::time::Duration::from_secs(300)); // 5 minutes
         model
     }
 
@@ -875,7 +1043,7 @@ pub mod common {
 ///
 /// [SeqCst]: std::sync::atomic::Ordering::SeqCst
 /// [Relaxed]: std::sync::atomic::Ordering::Relaxed
-#[cfg(test)]
+#[cfg(all(test, not(feature = "proptest")))]
 pub(crate) mod test {
     use super::*;
     use crate::macros::test::*;
@@ -936,16 +1104,14 @@ pub(crate) mod test {
             let rx = &rx;
 
             let handle = spawn! {
-                block_on! {
-                    for i in 0..4 {
-                        tracing::info!(i, "Sending element");
-                        // Sends and receives happen concurrently and lock-free!
-                        sx.send(i).await;
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    // Sends and receives happen concurrently and lock-free!
+                    sx.send(i);
                 }
             };
 
-            for i in 0..4 {
+            for i in 0..2 {
                 // Messages have to be acknowledged explicitly by the receiver, else
                 // they are added back to the queue to avoid message loss.
                 block_on! {
@@ -971,15 +1137,13 @@ pub(crate) mod test {
             assert_eq!(sx.queue.read_size(), 0);
 
             let handle = spawn! {
-                block_on! {
-                    tracing::info!(elem, "Sending element");
-                    assert_matches::assert_matches!(
-                        sx.send(DropCounter::new(vec![elem], counter1)).await,
-                        None,
-                        "Failed to send value, message queue is {:#?}",
-                        sx.queue
-                    );
-                }
+                tracing::info!(elem, "Sending element");
+                assert_matches::assert_matches!(
+                    sx.send(DropCounter::new(vec![elem], counter1)),
+                    None,
+                    "Failed to send value, message queue is {:#?}",
+                    sx.queue
+                );
             };
 
             block_on! {
@@ -1017,16 +1181,14 @@ pub(crate) mod test {
             assert_eq!(sx.queue.read_size(), 0);
 
             let handle = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx.queue
-                        )
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx.queue
+                    )
                 }
             };
 
@@ -1074,16 +1236,14 @@ pub(crate) mod test {
             assert_eq!(sx.queue.read_size(), 0);
 
             let handle1 = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx.queue
-                        )
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx.queue
+                    )
                 }
             };
 
@@ -1152,27 +1312,23 @@ pub(crate) mod test {
             assert_eq!(sx1.queue.read_size(), 0);
 
             let handle1 = spawn! {
-                block_on! {
-                    tracing::info!("Sending 42");
-                    assert_matches::assert_matches!(
-                        sx1.send(DropCounter::new(vec![42], counter1)).await,
-                        None,
-                        "Failed to send 42, message queue is {:#?}",
-                        sx1.queue
-                    )
-                }
+                tracing::info!("Sending 42");
+                assert_matches::assert_matches!(
+                    sx1.send(DropCounter::new(vec![42], counter1)),
+                    None,
+                    "Failed to send 42, message queue is {:#?}",
+                    sx1.queue
+                )
             };
 
             let handle2 = spawn! {
-                block_on! {
-                    tracing::info!("Sending 69");
-                    assert_matches::assert_matches!(
-                        sx2.send(DropCounter::new(vec![69], counter2)).await,
-                        None,
-                        "Failed to send 69, message queue is {:#?}",
-                        sx2.queue
-                    )
-                }
+                tracing::info!("Sending 69");
+                assert_matches::assert_matches!(
+                    sx2.send(DropCounter::new(vec![69], counter2)),
+                    None,
+                    "Failed to send 69, message queue is {:#?}",
+                    sx2.queue
+                )
             };
 
             block_on! {
@@ -1225,29 +1381,25 @@ pub(crate) mod test {
             let witness3 = std::sync::Arc::clone(&witness1);
 
             let handle1 = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx1.queue
-                        )
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx1.queue
+                    )
                 }
             };
             let handle2 = spawn! {
-                block_on! {
-                    for i in 2..4 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx2.queue
-                        )
-                    }
+                for i in 2..4 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx2.queue
+                    )
                 }
             };
             let handle3 = spawn! {
@@ -1382,16 +1534,14 @@ pub(crate) mod test {
             assert_eq!(sx1.queue.read_size(), 0);
 
             let handle = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx1.queue
-                        )
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx1.queue
+                    )
                 }
             };
 
@@ -1411,16 +1561,14 @@ pub(crate) mod test {
             join!(handle);
 
             let handle = spawn! {
-                block_on! {
-                    for i in 2..4 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx2.queue
-                        )
-                    }
+                for i in 2..4 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx2.queue
+                    )
                 }
             };
 
@@ -1463,23 +1611,19 @@ pub(crate) mod test {
             assert_eq!(sx1.queue.read_size(), 0);
 
             let handle1 = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await;
-                    }
-                    sx1.close().await;
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1)));
                 }
+                sx1.close();
             };
 
             let handle2 = spawn! {
-                block_on! {
-                    for i in 2..4 {
-                        tracing::info!(i, "Sending element");
-                        sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2))).await;
-                    }
-                    sx2.close().await;
+                for i in 2..4 {
+                    tracing::info!(i, "Sending element");
+                    sx2.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter2)));
                 }
+                sx2.close();
             };
 
             join!(handle1);
@@ -1506,16 +1650,14 @@ pub(crate) mod test {
             assert_eq!(sx.queue.read_size(), 0);
 
             let handle = spawn! {
-                block_on! {
-                    for _ in 0..2 {
-                        tracing::info!("Sending element");
-                        assert_matches::assert_matches!(
-                            sx.send(()).await,
-                            None,
-                            "Failed to send, message queue is {:#?}",
-                            sx.queue
-                        )
-                    }
+                for _ in 0..2 {
+                    tracing::info!("Sending element");
+                    assert_matches::assert_matches!(
+                        sx.send(()),
+                        None,
+                        "Failed to send, message queue is {:#?}",
+                        sx.queue
+                    )
                 }
             };
 
@@ -1555,30 +1697,26 @@ pub(crate) mod test {
             assert_eq!(sx1.queue.read_size(), 0);
 
             let handle = spawn! {
-                block_on! {
-                    for i in 0..2 {
-                        tracing::info!(i, "Sending element");
-                        assert_matches::assert_matches!(
-                            sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))).await,
-                            None,
-                            "Failed to send {i}, message queue is {:#?}",
-                            sx1.queue
-                        )
-                    }
+                for i in 0..2 {
+                    tracing::info!(i, "Sending element");
+                    assert_matches::assert_matches!(
+                        sx1.send(DropCounter::new(vec![i], std::sync::Arc::clone(&counter1))),
+                        None,
+                        "Failed to send {i}, message queue is {:#?}",
+                        sx1.queue
+                    )
                 }
             };
             join!(handle);
 
             let handle = spawn! {
-                block_on! {
-                    tracing::info!("Sending element");
-                    assert_matches::assert_matches!(
-                        sx2.send(DropCounter::new(vec![2], counter2)).await,
-                        Some(counter) => { assert_eq!(counter.get(), vec![2]) },
-                        "Queue should be full! {:#?}",
-                        sx2.queue
-                    )
-                }
+                tracing::info!("Sending element");
+                assert_matches::assert_matches!(
+                    sx2.send(DropCounter::new(vec![2], counter2)),
+                    Some(counter) => { assert_eq!(counter.get(), vec![2]) },
+                    "Queue should be full! {:#?}",
+                    sx2.queue
+                )
             };
             join!(handle);
 
@@ -1788,20 +1926,20 @@ mod proptesting {
 
                         if let Some(sx) = state.sxs.pop_back() {
                             tracing::debug!("Found a sender to process the request");
-                            let res = tokio_test::task::spawn(sx.send(elem)).poll();
+                            let res = sx.send(elem);
 
                             tracing::trace!(?ref_state, "Comparing to reference state");
                             match ref_state.status {
                                 Ok(_) => {
                                     tracing::debug!("Write is legal");
-                                    assert_eq!(res, std::task::Poll::Ready(None));
+                                    assert_eq!(res, None);
                                     tracing::info!("Write successful");
                                 }
                                 Err(_) => {
                                     tracing::debug!("Write is illegal");
                                     assert_matches::assert_matches!(
                                         res,
-                                        std::task::Poll::Ready(Some(e)) => { assert_eq!(e, elem) }
+                                        Some(e) => { assert_eq!(e, elem) }
                                     );
                                     tracing::info!("Write failed successfully ;)");
                                 }
