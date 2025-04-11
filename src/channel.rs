@@ -2003,9 +2003,9 @@ mod proptesting {
     #[derive(thiserror::Error, Clone, Debug)]
     enum PropError {
         #[error("Failed to shrink region, no space left")]
-        Shrink,
+        Shrink(String),
         #[error("Failed to grow region, no space left")]
-        Grow,
+        Grow(String),
     }
 
     struct SystemUnderTest {
@@ -2019,18 +2019,25 @@ mod proptesting {
         last_read: std::collections::VecDeque<u32>,
         last_writ: std::collections::VecDeque<u32>,
         status: Result<(), PropError>,
-        read: ReferenceRegion,
-        writ: ReferenceRegion,
+        read: ReferenceRegion<Read>,
+        writ: ReferenceRegion<Write>,
         next: u32,
         count_sx: usize,
         count_rx: usize,
         cap: u16,
+        size: u16,
     }
 
     #[derive(Clone, Debug)]
-    struct ReferenceRegion {
+    struct Read;
+    #[derive(Clone, Debug)]
+    struct Write;
+
+    #[derive(Clone, Debug)]
+    struct ReferenceRegion<Region: Clone + std::fmt::Debug> {
         start: u16,
         size: u16,
+        _phantom: std::marker::PhantomData<Region>,
     }
 
     #[derive(Clone, Debug)]
@@ -2122,7 +2129,7 @@ mod proptesting {
         type Reference = Reference;
 
         fn init_test(ref_state: &<Self::Reference as ReferenceStateMachine>::State) -> Self::SystemUnderTest {
-            let (sx, rx) = channel(ref_state.cap >> 1);
+            let (sx, rx) = channel(ref_state.cap);
             Self { sxs: std::collections::VecDeque::from([sx]), rxs: std::collections::VecDeque::from([rx]) }
         }
 
@@ -2154,11 +2161,12 @@ mod proptesting {
                                     assert_eq!(res, None);
                                     tracing::info!("Write successful");
                                 }
-                                Err(_) => {
-                                    tracing::debug!("Write is illegal");
+                                Err(ref err) => {
+                                    tracing::debug!(?err, "Write is illegal");
                                     assert_matches::assert_matches!(
                                         res,
-                                        Some(e) => { assert_eq!(e, elem) }
+                                        Some(e) => { assert_eq!(e, elem) },
+                                        "{err:?}"
                                     );
                                     tracing::info!("Write failed successfully ;)");
                                 }
@@ -2167,7 +2175,13 @@ mod proptesting {
                             tracing::debug!(?ref_state.writ, ?ref_state.read, "Checking read/write regions");
 
                             assert_eq!(sx.queue.writ_indx(), ref_state.writ.start);
-                            assert_eq!(sx.queue.writ_size(), ref_state.writ.size);
+                            assert_eq!(
+                                sx.queue.writ_size(),
+                                ref_state.writ.size,
+                                "{}: {}",
+                                sx.queue.cap,
+                                ref_state.cap
+                            );
                             assert_eq!(sx.queue.read_indx(), ref_state.read.start);
                             assert_eq!(sx.queue.read_size(), ref_state.read.size);
 
@@ -2307,22 +2321,24 @@ mod proptesting {
 
     impl Reference {
         fn new(cap_base: u16) -> Self {
-            let cap = cap_base << 2;
+            let cap = cap_base.next_power_of_two();
+            let size = cap << 1;
             Self {
                 last_read: Default::default(),
                 last_writ: Default::default(),
                 status: Ok(()),
-                read: ReferenceRegion::new_read(),
-                writ: ReferenceRegion::new_write(cap),
+                read: ReferenceRegion::<Read>::new(),
+                writ: ReferenceRegion::<Write>::new(size),
                 next: 0,
                 count_sx: 1,
                 count_rx: 1,
                 cap,
+                size,
             }
         }
 
         fn read(mut self) -> Result<Self, PropError> {
-            self.read.shrink(self.cap).map(|_| {
+            self.read.shrink(self.size).map(|_| {
                 self.last_read.push_front(self.last_writ.pop_back().expect("Invalid state"));
                 self.status = Ok(());
                 self
@@ -2331,8 +2347,8 @@ mod proptesting {
 
         fn write(mut self, elem: u32) -> Result<Self, PropError> {
             self.writ
-                .shrink(self.cap)
-                .or_else(|_| self.writ.grow(self.cap).and_then(|_| self.writ.shrink(self.cap)))
+                .shrink(self.size)
+                .or_else(|_| self.writ.grow(self.cap).and_then(|_| self.writ.shrink(self.size)))
                 .and_then(|_| self.read.grow(self.cap))
                 .map(|_| {
                     self.last_writ.push_front(elem);
@@ -2343,15 +2359,7 @@ mod proptesting {
         }
     }
 
-    impl ReferenceRegion {
-        fn new_read() -> Self {
-            Self { start: 0, size: 0 }
-        }
-
-        fn new_write(cap: u16) -> Self {
-            Self { start: 0, size: cap }
-        }
-
+    impl<Region: Clone + std::fmt::Debug> ReferenceRegion<Region> {
         fn len(&self) -> u16 {
             self.size
         }
@@ -2365,18 +2373,38 @@ mod proptesting {
         }
 
         fn can_shrink(&self) -> Result<(), PropError> {
-            if self.is_empty() { Err(PropError::Shrink) } else { Ok(()) }
+            if self.is_empty() { Err(PropError::Shrink(format!("{self:?}"))) } else { Ok(()) }
         }
 
-        fn shrink(&mut self, cap: u16) -> Result<(), PropError> {
+        fn shrink(&mut self, size: u16) -> Result<(), PropError> {
             self.can_shrink().map(|_| {
-                self.start = (self.start + 1) % cap;
+                self.start = (self.start + 1) % size;
                 self.size -= 1;
             })
         }
+    }
+
+    impl ReferenceRegion<Read> {
+        fn new() -> Self {
+            Self { start: 0, size: 0, _phantom: std::marker::PhantomData }
+        }
 
         fn can_grow(&self, cap: u16) -> Result<(), PropError> {
-            if self.is_full(cap) { Err(PropError::Grow) } else { Ok(()) }
+            if self.is_full(cap) { Err(PropError::Grow(format!("{self:?}"))) } else { Ok(()) }
+        }
+
+        fn grow(&mut self, cap: u16) -> Result<(), PropError> {
+            self.can_grow(cap).map(|_| self.size += 1)
+        }
+    }
+
+    impl ReferenceRegion<Write> {
+        fn new(size: u16) -> Self {
+            ReferenceRegion::<Write> { start: 0, size, _phantom: std::marker::PhantomData }
+        }
+
+        fn can_grow(&self, cap: u16) -> Result<(), PropError> {
+            if self.is_full(cap) { Err(PropError::Grow(format!("{self:?}"))) } else { Ok(()) }
         }
 
         fn grow(&mut self, cap: u16) -> Result<(), PropError> {
