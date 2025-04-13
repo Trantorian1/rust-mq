@@ -2347,8 +2347,8 @@ mod proptesting {
 
         fn write(mut self, elem: u32) -> Result<Self, PropError> {
             self.writ
-                .shrink(self.size)
-                .or_else(|_| self.writ.grow(self.cap).and_then(|_| self.writ.shrink(self.size)))
+                .shrink(self.cap, self.size)
+                .or_else(|_| self.writ.grow(self.size).and_then(|_| self.writ.shrink(self.cap, self.size)))
                 .and_then(|_| self.read.grow(self.cap))
                 .map(|_| {
                     self.last_writ.push_front(elem);
@@ -2372,6 +2372,20 @@ mod proptesting {
             self.size == cap
         }
 
+        fn can_grow(&self, capsize: u16) -> Result<(), PropError> {
+            if self.is_full(capsize) { Err(PropError::Grow(format!("{self:?}"))) } else { Ok(()) }
+        }
+
+        fn grow(&mut self, capsize: u16) -> Result<(), PropError> {
+            self.can_grow(capsize).map(|_| self.size += 1)
+        }
+    }
+
+    impl ReferenceRegion<Read> {
+        fn new() -> Self {
+            Self { start: 0, size: 0, _phantom: std::marker::PhantomData }
+        }
+
         fn can_shrink(&self) -> Result<(), PropError> {
             if self.is_empty() { Err(PropError::Shrink(format!("{self:?}"))) } else { Ok(()) }
         }
@@ -2384,31 +2398,20 @@ mod proptesting {
         }
     }
 
-    impl ReferenceRegion<Read> {
-        fn new() -> Self {
-            Self { start: 0, size: 0, _phantom: std::marker::PhantomData }
-        }
-
-        fn can_grow(&self, cap: u16) -> Result<(), PropError> {
-            if self.is_full(cap) { Err(PropError::Grow(format!("{self:?}"))) } else { Ok(()) }
-        }
-
-        fn grow(&mut self, cap: u16) -> Result<(), PropError> {
-            self.can_grow(cap).map(|_| self.size += 1)
-        }
-    }
-
     impl ReferenceRegion<Write> {
         fn new(size: u16) -> Self {
             ReferenceRegion::<Write> { start: 0, size, _phantom: std::marker::PhantomData }
         }
 
-        fn can_grow(&self, cap: u16) -> Result<(), PropError> {
-            if self.is_full(cap) { Err(PropError::Grow(format!("{self:?}"))) } else { Ok(()) }
+        fn can_shrink(&self, cap: u16) -> Result<(), PropError> {
+            if self.size <= cap { Err(PropError::Shrink(format!("{self:?}"))) } else { Ok(()) }
         }
 
-        fn grow(&mut self, cap: u16) -> Result<(), PropError> {
-            self.can_grow(cap).map(|_| self.size += 1)
+        fn shrink(&mut self, cap: u16, size: u16) -> Result<(), PropError> {
+            self.can_shrink(cap).map(|_| {
+                self.start = (self.start + 1) % size;
+                self.size -= 1;
+            })
         }
     }
 }
