@@ -84,7 +84,7 @@ pub struct MqGuard<'a, T: TBound> {
 /// ```
 ///
 /// The write region will grow as needed during attempted writes. In the above example, cells 0 and
-/// 1 can be overwritten as they have been read and acknowledged, but cell 2 cannot as it has not
+/// 1 can be overwritten as they have been read _and_ acknowledged, but cell 2 cannot as it has not
 /// been acknowledged yet! Cells 3 till 8 cannot be overwritten as they are part of the current read
 /// or write regions.
 ///
@@ -123,6 +123,13 @@ pub struct MqGuard<'a, T: TBound> {
 ///
 /// Where several non-consecutive cells have not yet been acknowledged. This is checked when we try
 /// and grow the write region to make sure we only overwrite cell which have been acknowledged.
+///
+/// ## Resending
+///
+/// To make sure values can always be re-sent into the queue if they are not acknowledged, we
+/// allocate for twice the required capacity when calling [`channel`]. Half of this space is
+/// reserved for re-sends to ensure that if ever a value is not acknowledged, there will _always_ be
+/// enough space left in the queue to resend it.
 ///
 /// [`AtomicU64`]: std::sync::atomic::AtomicU64
 /// [`AtomicBool`]: std::sync::atomic::AtomicBool
@@ -205,8 +212,6 @@ impl<T: TBound> Drop for MqSender<T> {
 
 impl<T: TBound> Drop for MqGuard<'_, T> {
     fn drop(&mut self) {
-        // TODO: update this section one we have a working implementation
-        //
         // If the element was not acknowledged, we add it back to the queue to be picked up again,
         // taking special care to drop the element in the process. We do not need to do this if the
         // element was acknowledged since the drop logic is implemented in `elem_drop` and this is
@@ -221,9 +226,11 @@ impl<T: TBound> Drop for MqGuard<'_, T> {
             let elem = self.elem_take();
             self.cell.ack.store(true, sync::atomic::Ordering::Release);
 
-            self.queue.write(elem, 0);
+            // We can be sure this send will succeed since we reserve half the capacity of the
+            // message queue for resends.
+            let res = self.queue.write(elem, 0);
             self.waker.notify_one();
-            // debug_assert!(res.is_none());
+            debug_assert!(res.is_none());
         }
     }
 }

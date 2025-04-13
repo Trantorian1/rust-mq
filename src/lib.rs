@@ -1,4 +1,4 @@
-//! `rust-mq` is a asynchronous, lock-free, multiple-producer, multiple-receiver message queue
+//! `rust-mq` is a asynchronous, lock-free, multiple-producer, multiple-consumer message queue
 //! implementation in unsafe Rust, designed to prevent message loss while maintaining high
 //! performance and minimizing copies.
 //!
@@ -27,7 +27,8 @@
 //!    very useful in the context of cancellation safety or when running multiple futures against
 //!    each other.
 //!
-//! The following is a simple example of using `rust-mq` as a bounded spsc channel:
+//! The following is a simple example of using `rust-mq` as a bounded single-producer,
+//! single-consumer (mpsc) channel:
 //!
 //! ```rust
 //! #[tokio::main]

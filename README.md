@@ -1,6 +1,6 @@
 # 🦀 `rust-mq`
 
-`rust-mq` is a **asynchronous**, **lock-free**, multiple-producer, multiple-receiver message queue 
+`rust-mq` is a **asynchronous**, **lock-free**, multiple-producer, multiple-consumer message queue 
 implementation in unsafe Rust, designed to prevent message loss while maintaining high
 performance and minimizing copies.
 
@@ -14,8 +14,8 @@ cargo doc --no-deps --all-features && \
 ## ⚙️ Usage
 
 You can create a new message queue with `channel`. This will allocate a fixed-size ring buffer
-up-front for the queue to use. `rust-mq` differs from other channels though in ways that make
-it especially suited to handling application-critical information:
+for the queue to use. `rust-mq` differs from other channels in ways that make it especially suited
+to handling application-critical information:
 
 1. When resubscribing, a new receiver will still be able to receive messages which were sent
    before it was created, as long as those messages have not already been received.
@@ -32,14 +32,15 @@ it especially suited to handling application-critical information:
    very useful in the context of cancellation safety or when running multiple futures against
    each other.
 
-The following is a simple example of using `rust-mq` as a bounded spsc channel:
+The following is a simple example of using `rust-mq` as a bounded single-producer, single-consumer
+(spsc) channel:
 
 ```rust
 #[tokio::main]
 async fn main() {
     let (sx, rx) = rust_mq::channel(100);
 
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         for i in 0..100 {
             // Sends and receives happen concurrently and lock-free!
             sx.send(i);
@@ -51,8 +52,6 @@ async fn main() {
         // they are added back to the queue to avoid message loss.
         assert_eq!(rx.recv().await.read_acknowledge(), i);
     };
-
-    handle.join().await;
 }
 ```
 
@@ -66,9 +65,9 @@ drop transitions. On top of this, known edge cases are tested manually to avoid 
 Each test is also run against [`miri`] to ensure we are not relying on any undefined behavior.
  
 While this helps ensure a reasonable level of confidence in the system, this is by no means an
-exaustive search as some concurrent execution tests had to be bounded in their exploration of
-the problem space due to an exponential explosion in complexity. Similarly, proptest performs
-a _reasonable_ exploration but does not check every single possible permutation of operations.
+exhaustive search as most concurrent execution tests had to be bounded in their exploration of the
+problem space due to an exponential explosion in complexity. Similarly, proptest performs a 
+_reasonable_ exploration but does not check every single possible permutation of operations.
  
 Still, this gives us strong guarantees that `rust-mq` works as intended.
 
