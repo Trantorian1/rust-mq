@@ -126,6 +126,7 @@
 
 mod channel;
 mod macros;
+mod stream;
 mod sync;
 
 pub use channel::*;

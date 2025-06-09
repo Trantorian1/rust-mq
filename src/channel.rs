@@ -412,7 +412,7 @@ impl<T: TBound> MqSender<T> {
         //
         // 2. Another thread updates the write region as part of the `write` method. (Thread B)
         //
-        // - The read region is currently { indx: 0, size: 4 }
+        // - The read region is currently { indx: 0, size: 3 }
         // - The write region is currently { indx: 4, size: 3 }
         //
         // 3. We update the read/write region. Notice the change in `indx`! (Thread A)
