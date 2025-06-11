@@ -125,6 +125,7 @@
 //! [`resubscribe`]: MqSender::resubscribe
 
 mod channel;
+mod inc_reserve;
 mod macros;
 mod stream;
 mod sync;

@@ -19,6 +19,7 @@ struct AtomicWakerList {
     // We can probably assume that both the first few nodes at the head and the last few nodes at
     // the tail will be kept around in (ideally L1) cache as long as we keep pushing at popping at
     // a constant rate (ie: we often read a few head nodes and a few tail nodes).
+    // TODO: do not deallocate once a cell is made empty!!!
     head: Option<std::sync::atomic::AtomicPtr<CacheLine>>,
     tail: Option<std::sync::atomic::AtomicPtr<CacheLine>>,
 }
