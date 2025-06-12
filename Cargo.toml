@@ -27,6 +27,7 @@ proptest-state-machine = { version = "0.3.1", optional = true }
 
 # Errors
 thiserror = "2.0.12"
+num = "0.4.3"
 
 [dev-dependencies]
 

@@ -29,10 +29,10 @@ struct AtomicWakerList {
 #[repr(C)]
 struct CacheLine {
     //                                                   64 bytes (budget)
-    waker: [std::task::Waker; 3],           // 16 * 3 => 48 bytes
-    next: std::sync::atomic::AtomicPtr<()>, //  8 * 1 =>  8 bytes
     strt: u32,                              //  4 * 1 =>  4 bytes
     size: u32,                              //  4 * 1 =>  4 bytes
+    next: std::sync::atomic::AtomicPtr<()>, //  8 * 1 =>  8 bytes
+    waker: [std::task::Waker; 15],          // 16 * 3 => 48 bytes
 }
 
 #[cfg(test)]
