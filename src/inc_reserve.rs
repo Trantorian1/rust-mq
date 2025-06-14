@@ -43,7 +43,7 @@ pub trait QuarterSize: Sized {
 
     fn new(n: Self::Quarter) -> Self;
     fn read(&self) -> RawBytes<Self>;
-    fn write(&self, pre: Self::Raw, new: RawBytes<Self>) -> Result<(), RawBytes<Self>>;
+    fn write(&self, pre: Self::Raw, new: &RawBytes<Self>) -> Result<Self::Raw, RawBytes<Self>>;
 }
 impl QuarterSize for sync::atomic::AtomicU64 {
     type Raw = u64;
@@ -64,13 +64,13 @@ impl QuarterSize for sync::atomic::AtomicU64 {
         }
     }
 
-    fn write(&self, pre: Self::Raw, new: RawBytes<Self>) -> Result<(), RawBytes<Self>> {
+    fn write(&self, pre: Self::Raw, new: &RawBytes<Self>) -> Result<Self::Raw, RawBytes<Self>> {
         let new = ((new.read_indx as u64) << 48)
             | ((new.read_size as u64) << 32)
             | ((new.writ_indx as u64) << 16)
             | new.writ_size as u64;
         match self.compare_exchange(pre, new, sync::atomic::Ordering::Release, sync::atomic::Ordering::Acquire) {
-            Ok(_) => Ok(()),
+            Ok(raw) => Ok(raw),
             Err(raw_bytes) => Err(RawBytes {
                 raw: raw_bytes,
                 read_indx: ((raw_bytes & 0xffff000000000000) >> 48) as u16,
@@ -100,13 +100,13 @@ impl QuarterSize for sync::atomic::AtomicU32 {
         }
     }
 
-    fn write(&self, pre: Self::Raw, new: RawBytes<Self>) -> Result<(), RawBytes<Self>> {
+    fn write(&self, pre: Self::Raw, new: &RawBytes<Self>) -> Result<Self::Raw, RawBytes<Self>> {
         let new = ((new.read_indx as u32) << 24)
             | ((new.read_size as u32) << 16)
             | ((new.writ_indx as u32) << 8)
             | (new.writ_size as u32);
         match self.compare_exchange(pre, new, sync::atomic::Ordering::Release, sync::atomic::Ordering::Acquire) {
-            Ok(_) => Ok(()),
+            Ok(raw) => Ok(raw),
             Err(raw_bytes) => Err(RawBytes {
                 raw: raw_bytes,
                 read_indx: ((raw_bytes & 0xff000000) >> 24) as u8,
@@ -132,13 +132,27 @@ impl<S: QuarterSize> IncReserve<S> {
         let mut load = self.raw_bytes.read();
         loop {
             if load.writ_size.is_zero() {
-                break false;
+                return false;
             }
 
             load.writ_size = load.writ_size.wrapping_sub(&S::Quarter::one());
             load.writ_indx = load.writ_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
 
-            match self.raw_bytes.write(load.raw, load) {
+            match self.raw_bytes.write(load.raw, &load) {
+                Ok(raw) => {
+                    load.raw = raw;
+                    break;
+                }
+                Err(store) => load = store,
+            }
+        }
+
+        // TODO: generic write logic goes here
+
+        loop {
+            load.read_size = load.read_size.wrapping_add(&S::Quarter::one());
+
+            match self.raw_bytes.write(load.raw, &load) {
                 Ok(_) => break true,
                 Err(store) => load = store,
             }
@@ -155,7 +169,10 @@ impl<S: QuarterSize> IncReserve<S> {
             load.read_size = load.writ_indx.wrapping_sub(&S::Quarter::one());
             load.read_indx = load.read_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
 
-            match self.raw_bytes.write(load.raw, load) {
+            // TODO: replace this with generic grow_write logic
+            load.writ_size = load.writ_size.wrapping_add(&S::Quarter::one());
+
+            match self.raw_bytes.write(load.raw, &load) {
                 Ok(_) => break true,
                 Err(store) => load = store,
             }
@@ -175,6 +192,16 @@ mod test {
         assert!(incres.reserve());
         assert!(incres.reserve());
         assert!(incres.reserve());
+        assert!(incres.reserve());
+        assert!(!incres.reserve());
+    }
+
+    #[test]
+    fn release() {
+        let incres = IncReserveU16::new(1);
+        assert!(incres.reserve());
+        assert!(!incres.reserve());
+        assert!(incres.release());
         assert!(incres.reserve());
         assert!(!incres.reserve());
     }
