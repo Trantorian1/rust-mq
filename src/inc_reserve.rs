@@ -5,10 +5,10 @@ use num::{
 
 use crate::sync::*;
 
-type IncReserveU16 = IncReserve<sync::atomic::AtomicU64>;
-type IncReserveU8 = IncReserve<sync::atomic::AtomicU32>;
+type IncReserveU16<GW> = IncReserve<sync::atomic::AtomicU64, GW>;
+type IncReserveU8<GW> = IncReserve<sync::atomic::AtomicU32, GW>;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct RawBytes<T: QuarterSize + Sized> {
     raw: T::Raw,
     read_indx: T::Quarter,
@@ -16,6 +16,19 @@ struct RawBytes<T: QuarterSize + Sized> {
     writ_indx: T::Quarter,
     writ_size: T::Quarter,
 }
+
+impl<T: QuarterSize + Sized> Clone for RawBytes<T> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw,
+            read_indx: self.read_indx,
+            read_size: self.read_size,
+            writ_indx: self.writ_indx,
+            writ_size: self.writ_size,
+        }
+    }
+}
+impl<T: QuarterSize + Sized> Copy for RawBytes<T> {}
 
 impl<T: QuarterSize + Sized> std::fmt::Debug for RawBytes<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,24 +131,41 @@ impl QuarterSize for sync::atomic::AtomicU32 {
     }
 }
 
-pub struct IncReserve<S: QuarterSize> {
-    raw_bytes: S,
-    size: S::Quarter,
+trait AtomicGrow {
+    fn grow<T: QuarterSize + Sized>(&self, bytes: &RawBytes<T>) -> bool;
+}
+trait AtomicWrit {
+    fn write<T: QuarterSize + Sized>(&mut self, bytes: &RawBytes<T>);
 }
 
-impl<S: QuarterSize> IncReserve<S> {
+pub struct IncReserve<S, GW>
+where
+    S: QuarterSize,
+    GW: AtomicGrow + AtomicWrit,
+{
+    raw_bytes: S,
+    size: S::Quarter,
+    _phantom: std::marker::PhantomData<GW>,
+}
+
+impl<S, GW> IncReserve<S, GW>
+where
+    S: QuarterSize,
+    GW: AtomicGrow + AtomicWrit,
+{
     pub fn new(size: S::Quarter) -> Self {
-        Self { raw_bytes: S::new(size), size }
+        Self { raw_bytes: S::new(size), size, _phantom: std::marker::PhantomData }
     }
 
-    pub fn reserve(&self) -> bool {
+    pub fn reserve(&self, grow_write: &mut GW) -> bool {
         let mut load = self.raw_bytes.read();
         loop {
-            if load.writ_size.is_zero() {
+            if load.writ_size.is_zero() && !grow_write.grow(&load) {
                 return false;
+            } else {
+                load.writ_size = load.writ_size.wrapping_sub(&S::Quarter::one());
             }
 
-            load.writ_size = load.writ_size.wrapping_sub(&S::Quarter::one());
             load.writ_indx = load.writ_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
 
             match self.raw_bytes.write(load.raw, &load) {
@@ -147,7 +177,7 @@ impl<S: QuarterSize> IncReserve<S> {
             }
         }
 
-        // TODO: generic write logic goes here
+        grow_write.write(&load);
 
         loop {
             load.read_size = load.read_size.wrapping_add(&S::Quarter::one());
@@ -182,27 +212,48 @@ impl<S: QuarterSize> IncReserve<S> {
 
 #[cfg(test)]
 mod test {
-    use crate::inc_reserve::QuarterSize;
+    use super::*;
 
-    use super::IncReserveU16;
+    struct GrowAlways;
+    struct GrowNever;
+
+    impl AtomicGrow for GrowAlways {
+        fn grow<T: QuarterSize + Sized>(&self, _bytes: &RawBytes<T>) -> bool {
+            true
+        }
+    }
+    impl AtomicWrit for GrowAlways {
+        fn write<T: QuarterSize + Sized>(&mut self, _bytes: &RawBytes<T>) {}
+    }
+
+    impl AtomicGrow for GrowNever {
+        fn grow<T: QuarterSize + Sized>(&self, _bytes: &RawBytes<T>) -> bool {
+            false
+        }
+    }
+    impl AtomicWrit for GrowNever {
+        fn write<T: QuarterSize + Sized>(&mut self, _bytes: &RawBytes<T>) {}
+    }
 
     #[test]
     fn reserve() {
         let incres = IncReserveU16::new(4);
-        assert!(incres.reserve());
-        assert!(incres.reserve());
-        assert!(incres.reserve());
-        assert!(incres.reserve());
-        assert!(!incres.reserve());
+        let mut grow_write = GrowNever;
+        assert!(incres.reserve(&mut grow_write));
+        assert!(incres.reserve(&mut grow_write));
+        assert!(incres.reserve(&mut grow_write));
+        assert!(incres.reserve(&mut grow_write));
+        assert!(!incres.reserve(&mut grow_write));
     }
 
     #[test]
     fn release() {
         let incres = IncReserveU16::new(1);
-        assert!(incres.reserve());
-        assert!(!incres.reserve());
+        let mut grow_write = GrowAlways;
+        assert!(incres.reserve(&mut grow_write));
+        assert!(!incres.reserve(&mut grow_write));
         assert!(incres.release());
-        assert!(incres.reserve());
-        assert!(!incres.reserve());
+        assert!(incres.reserve(&mut grow_write));
+        assert!(!incres.reserve(&mut grow_write));
     }
 }
