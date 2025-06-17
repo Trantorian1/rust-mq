@@ -1,3 +1,5 @@
+use std::ops::Add;
+
 use num::{
     Integer, One, Zero,
     traits::{WrappingAdd, WrappingSub},
@@ -5,11 +7,11 @@ use num::{
 
 use crate::sync::*;
 
-type IncReserveU16<GW> = IncReserve<sync::atomic::AtomicU64, GW>;
-type IncReserveU8<GW> = IncReserve<sync::atomic::AtomicU32, GW>;
+type IncReserveU16<GW, GR> = IncReserve<sync::atomic::AtomicU64, GW, GR>;
+type IncReserveU8<GW, GR> = IncReserve<sync::atomic::AtomicU32, GW, GR>;
 
 #[derive(Eq, PartialEq)]
-struct RawBytes<T: QuarterSize + Sized> {
+pub struct RawBytes<T: QuarterSize + Sized> {
     raw: T::Raw,
     read_indx: T::Quarter,
     read_size: T::Quarter,
@@ -52,6 +54,7 @@ pub trait QuarterSize: Sized {
         + num::traits::WrappingAdd
         + std::cmp::PartialEq
         + std::fmt::Debug
+        + Into<usize>
         + Copy;
 
     fn new(n: Self::Quarter) -> Self;
@@ -131,129 +134,149 @@ impl QuarterSize for sync::atomic::AtomicU32 {
     }
 }
 
-trait AtomicGrow {
-    fn grow<T: QuarterSize + Sized>(&self, bytes: &RawBytes<T>) -> bool;
+pub trait AtomicRead {
+    type Item;
+
+    fn grow<S: QuarterSize + Sized>(&self, bytes: &RawBytes<S>) -> bool;
+    fn read<S: QuarterSize + Sized>(&self, read_indx: S::Quarter) -> Self::Item;
 }
-trait AtomicWrit {
-    fn write<T: QuarterSize + Sized>(&mut self, bytes: &RawBytes<T>);
+pub trait AtomicWrit {
+    type Item;
+
+    fn grow<S: QuarterSize + Sized>(&self, bytes: &RawBytes<S>) -> bool;
+    fn writ<S: QuarterSize + Sized>(&self, writ_indx: S::Quarter, item: Self::Item);
 }
 
-pub struct IncReserve<S, GW>
+pub struct IncReserve<S, R, W>
 where
     S: QuarterSize,
-    GW: AtomicGrow + AtomicWrit,
+    R: AtomicRead,
+    W: AtomicWrit,
 {
     raw_bytes: S,
     size: S::Quarter,
-    _phantom: std::marker::PhantomData<GW>,
+    _phantom: std::marker::PhantomData<(R, W)>,
 }
 
-impl<S, GW> IncReserve<S, GW>
+impl<S, R, W> IncReserve<S, R, W>
 where
     S: QuarterSize,
-    GW: AtomicGrow + AtomicWrit,
+    R: AtomicRead,
+    W: AtomicWrit,
 {
     pub fn new(size: S::Quarter) -> Self {
         Self { raw_bytes: S::new(size), size, _phantom: std::marker::PhantomData }
     }
 
-    pub fn reserve(&self, grow_write: &mut GW) -> bool {
-        let mut load = self.raw_bytes.read();
+    pub fn read_release(&self, grow_read: &R) -> Option<R::Item> {
+        let mut bytes = self.raw_bytes.read();
         loop {
-            if load.writ_size.is_zero() && !grow_write.grow(&load) {
-                return false;
+            // FIXME: is it really pertinent to allow the read region to grow here?
+            if bytes.read_size.is_zero() && !grow_read.grow(&bytes) {
+                break None;
             } else {
-                load.writ_size = load.writ_size.wrapping_sub(&S::Quarter::one());
+                bytes.read_size = bytes.writ_indx.wrapping_sub(&S::Quarter::one());
             }
 
-            load.writ_indx = load.writ_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
+            let read_indx = bytes.read_indx;
+            bytes.read_indx = bytes.read_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
+            let data = Some(grow_read.read::<S>(read_indx)); // WARNING: don't read this yet!
 
-            match self.raw_bytes.write(load.raw, &load) {
-                Ok(raw) => {
-                    load.raw = raw;
-                    break;
-                }
-                Err(store) => load = store,
-            }
-        }
-
-        grow_write.write(&load);
-
-        loop {
-            load.read_size = load.read_size.wrapping_add(&S::Quarter::one());
-
-            match self.raw_bytes.write(load.raw, &load) {
-                Ok(_) => break true,
-                Err(store) => load = store,
+            match self.raw_bytes.write(bytes.raw, &bytes) {
+                Ok(_raw) => break data,
+                Err(store) => bytes = store,
             }
         }
     }
 
-    pub fn release(&self) -> bool {
-        let mut load = self.raw_bytes.read();
-        loop {
-            if load.read_size.is_zero() {
-                break false;
+    pub fn writ_reserve(&self, grow_writ: &W, item: W::Item) -> bool {
+        let mut bytes = self.raw_bytes.read();
+        let writ_indx = loop {
+            if bytes.writ_size.is_zero() && !grow_writ.grow(&bytes) {
+                return false;
+            } else {
+                bytes.writ_size = bytes.writ_size.wrapping_sub(&S::Quarter::one());
             }
 
-            load.read_size = load.writ_indx.wrapping_sub(&S::Quarter::one());
-            load.read_indx = load.read_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
+            let writ_indx = bytes.writ_indx;
+            bytes.writ_indx = bytes.writ_indx.wrapping_add(&S::Quarter::one()).mod_floor(&self.size);
 
-            // TODO: replace this with generic grow_write logic
-            load.writ_size = load.writ_size.wrapping_add(&S::Quarter::one());
+            match self.raw_bytes.write(bytes.raw, &bytes) {
+                Ok(_raw) => break writ_indx,
+                Err(store) => bytes = store,
+            }
+        };
 
-            match self.raw_bytes.write(load.raw, &load) {
+        grow_writ.writ::<S>(writ_indx, item);
+
+        loop {
+            bytes.read_size = bytes.read_size.wrapping_add(&S::Quarter::one());
+
+            match self.raw_bytes.write(bytes.raw, &bytes) {
                 Ok(_) => break true,
-                Err(store) => load = store,
+                Err(store) => bytes = store,
             }
         }
+    }
+}
+
+struct AtomicStack<T: Send + Sync> {
+    inc_reserve: IncReserveU16<Self, Self>,
+    size: u16,
+    ring: std::ptr::NonNull<T>,
+}
+
+impl<T: Send + Sync> AtomicRead for AtomicStack<T> {
+    type Item = T;
+
+    fn grow<S: QuarterSize + Sized>(&self, _bytes: &RawBytes<S>) -> bool {
+        false
+    }
+
+    fn read<S: QuarterSize + Sized>(&self, read_indx: S::Quarter) -> Self::Item {
+        unsafe { self.ring.add(Into::<usize>::into(read_indx)).read() }
+    }
+}
+
+impl<T: Send + Sync> AtomicWrit for AtomicStack<T> {
+    type Item = T;
+
+    fn grow<S: QuarterSize + Sized>(&self, bytes: &RawBytes<S>) -> bool {
+        if Into::<usize>::into(bytes.read_size.add(bytes.writ_size)) < self.size as usize {
+            unsafe { self.ring.add(Into::<usize>::into(bytes.writ_indx)).drop_in_place() };
+            true
+        } else {
+            false
+        }
+    }
+
+    fn writ<S: QuarterSize + Sized>(&self, writ_indx: S::Quarter, item: Self::Item) {
+        unsafe { self.ring.add(Into::<usize>::into(writ_indx)).write(item) }
+    }
+}
+
+impl<T: Send + Sync> AtomicStack<T> {
+    pub fn new(size: u16) -> Self {
+        let layout = alloc::Layout::array::<T>(size as usize).unwrap();
+        assert!(layout.size() <= isize::MAX as usize);
+
+        let ptr = unsafe { alloc::alloc(layout) };
+        let ring = match std::ptr::NonNull::new(ptr as *mut T) {
+            Some(p) => p,
+            None => std::alloc::handle_alloc_error(layout),
+        };
+
+        Self { inc_reserve: IncReserve::new(size), size, ring }
+    }
+
+    pub fn push(&self, item: T) -> bool {
+        self.inc_reserve.writ_reserve(self, item)
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        self.inc_reserve.read_release(&self)
     }
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    struct GrowAlways;
-    struct GrowNever;
-
-    impl AtomicGrow for GrowAlways {
-        fn grow<T: QuarterSize + Sized>(&self, _bytes: &RawBytes<T>) -> bool {
-            true
-        }
-    }
-    impl AtomicWrit for GrowAlways {
-        fn write<T: QuarterSize + Sized>(&mut self, _bytes: &RawBytes<T>) {}
-    }
-
-    impl AtomicGrow for GrowNever {
-        fn grow<T: QuarterSize + Sized>(&self, _bytes: &RawBytes<T>) -> bool {
-            false
-        }
-    }
-    impl AtomicWrit for GrowNever {
-        fn write<T: QuarterSize + Sized>(&mut self, _bytes: &RawBytes<T>) {}
-    }
-
-    #[test]
-    fn reserve() {
-        let incres = IncReserveU16::new(4);
-        let mut grow_write = GrowNever;
-        assert!(incres.reserve(&mut grow_write));
-        assert!(incres.reserve(&mut grow_write));
-        assert!(incres.reserve(&mut grow_write));
-        assert!(incres.reserve(&mut grow_write));
-        assert!(!incres.reserve(&mut grow_write));
-    }
-
-    #[test]
-    fn release() {
-        let incres = IncReserveU16::new(1);
-        let mut grow_write = GrowAlways;
-        assert!(incres.reserve(&mut grow_write));
-        assert!(!incres.reserve(&mut grow_write));
-        assert!(incres.release());
-        assert!(incres.reserve(&mut grow_write));
-        assert!(!incres.reserve(&mut grow_write));
-    }
-}
+mod test {}
