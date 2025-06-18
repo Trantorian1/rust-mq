@@ -279,4 +279,24 @@ impl<T: Send + Sync> AtomicStack<T> {
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+
+    #[test]
+    fn push() {
+        let stack = AtomicStack::new(4);
+        assert!(stack.push(0));
+        assert!(stack.push(1));
+        assert!(stack.push(2));
+        assert!(stack.push(3));
+        assert!(!stack.push(4));
+    }
+
+    #[test]
+    fn pop() {
+        let stack = AtomicStack::new(1);
+        assert!(stack.pop().is_none());
+        assert!(stack.push(42));
+        assert_eq!(stack.pop(), Some(42));
+    }
+}
